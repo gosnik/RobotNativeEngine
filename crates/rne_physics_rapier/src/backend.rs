@@ -92,6 +92,11 @@ struct RapierWorldState {
     /// articulation joint is revolute or prismatic becomes an extra impulse joint,
     /// closing a loop, while the articulation joint keeps its coordinate.
     entity_to_attachment: HashMap<Entity, ImpulseJointHandle>,
+    /// Deterministic per-sync entity snapshot shared by all ECS-to-Rapier passes.
+    ///
+    /// The vector is refreshed after stale-handle cleanup and retains its capacity
+    /// between syncs, avoiding repeated allocation and sorting of the same world.
+    entity_snapshot: Vec<Entity>,
     contacts: Vec<ContactEvent>,
     contact_points: Vec<ContactPointSample>,
     /// Bodies carrying a one-step disturbance force, cleared after the next step.
@@ -443,14 +448,17 @@ fn remove_position_motor_diagnostic_components(world: &mut World, state: &mut Ra
 }
 
 #[cfg(feature = "position-motor-diagnostics")]
-fn sync_position_motor_diagnostic_targets(world: &mut World, state: &mut RapierWorldState) {
+fn sync_position_motor_diagnostic_targets(world: &World, state: &mut RapierWorldState) {
     if !state.position_motor_diagnostics_enabled {
         return;
     }
-    state.pending_position_motor_diagnostics = sorted_entities(world)
-        .into_iter()
-        .filter_map(|entity| position_motor_diagnostic_target(world, state, entity))
-        .collect();
+    state.pending_position_motor_diagnostics.clear();
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
+        if let Some(target) = position_motor_diagnostic_target(world, state, entity) {
+            state.pending_position_motor_diagnostics.push(target);
+        }
+    }
 }
 
 #[cfg(feature = "position-motor-diagnostics")]
@@ -625,6 +633,7 @@ impl PhysicsBackend for RapierBackend {
                 entity_to_joint: HashMap::new(),
                 entity_to_multibody_joint: HashMap::new(),
                 entity_to_attachment: HashMap::new(),
+                entity_snapshot: Vec::new(),
                 contacts: Vec::new(),
                 contact_points: Vec::new(),
                 impulse_forced: Vec::new(),
@@ -660,11 +669,13 @@ impl PhysicsBackend for RapierBackend {
             remove_position_motor_diagnostic_components(world, state);
         }
 
+        refresh_entity_snapshot(world, state);
+
         // Iterate in a stable entity order so Rapier handle assignment and the
         // resulting solver order are deterministic regardless of ECS archetype
         // layout (see AGENTS.md determinism requirements).
-        for entity in sorted_entities(world) {
-            let transform = world_transform_of(world, entity);
+        for index in 0..state.entity_snapshot.len() {
+            let entity = state.entity_snapshot[index];
             let Some(rigid_body) = world.get::<RigidBody>(entity) else {
                 continue;
             };
@@ -695,6 +706,7 @@ impl PhysicsBackend for RapierBackend {
                 continue;
             }
 
+            let transform = world_transform_of(world, entity);
             let isometry = transform_to_isometry(&transform);
 
             if let Some(body_handle) = state.entity_to_body.get(&entity).copied() {
@@ -1417,11 +1429,13 @@ fn normalized_axis(axis: Vec3) -> Unit<Vector3<f32>> {
     }
 }
 
-/// Returns all live entities sorted by id for deterministic backend iteration.
-fn sorted_entities(world: &World) -> Vec<Entity> {
-    let mut entities: Vec<Entity> = world.iter_entities().map(|entity| entity.id()).collect();
-    entities.sort_unstable();
-    entities
+/// Refreshes the deterministic entity snapshot shared by an ECS-to-Rapier sync.
+fn refresh_entity_snapshot(world: &World, state: &mut RapierWorldState) {
+    state.entity_snapshot.clear();
+    state
+        .entity_snapshot
+        .extend(world.iter_entities().map(|entity| entity.id()));
+    state.entity_snapshot.sort_unstable();
 }
 
 fn sync_joints_from_ecs(world: &World, state: &mut RapierWorldState) -> Result<(), PhysicsError> {
@@ -1452,7 +1466,8 @@ fn sync_joints_from_ecs(world: &World, state: &mut RapierWorldState) -> Result<(
         }
     }
 
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         if state.entity_to_joint.contains_key(&entity)
             || state.entity_to_multibody_joint.contains_key(&entity)
         {
@@ -1556,7 +1571,8 @@ fn sync_attachments_from_ecs(world: &World, state: &mut RapierWorldState) {
             state.impulse_joints.remove(handle, true);
         }
     }
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         if state.entity_to_attachment.contains_key(&entity)
             || !state.entity_to_multibody_joint.contains_key(&entity)
             || !has_articulated_coordinate(world, entity)
@@ -1581,7 +1597,8 @@ fn sync_attachments_from_ecs(world: &World, state: &mut RapierWorldState) {
 }
 
 fn apply_joint_motors(world: &World, state: &mut RapierWorldState) -> Result<(), PhysicsError> {
-    for id in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let id = state.entity_snapshot[index];
         let entity = world.entity(id);
         if let Some(armature) = entity.get::<RevoluteJointArmature>() {
             if !cfg!(feature = "experimental-armature") && armature.inertia_kg_m2 != 0.0 {
@@ -1779,7 +1796,8 @@ fn apply_direct_joint_efforts(
     world: &World,
     state: &mut RapierWorldState,
 ) -> Result<(), PhysicsError> {
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         let Some(command) = world.get::<JointActuation>(entity).copied() else {
             continue;
         };
@@ -1848,7 +1866,8 @@ fn apply_passive_coulomb_friction(
     world: &World,
     state: &mut RapierWorldState,
 ) -> Result<(), PhysicsError> {
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         let Some(dynamics) = world.get::<JointPassiveDynamics>(entity).copied() else {
             continue;
         };
@@ -2389,7 +2408,9 @@ mod tests {
         for _ in 0..12 {
             step_physics(&mut backend, &mut world, id, fixed_step()).unwrap();
             hashes.push(rne_physics::hash_physics_state_v2(&world));
-            for entity in sorted_entities(&world) {
+            let mut entities: Vec<_> = world.iter_entities().map(|entity| entity.id()).collect();
+            entities.sort_unstable();
+            for entity in entities {
                 let (Some(body), Some(transform)) = (
                     world.get::<RigidBody>(entity),
                     world.get::<Transform3>(entity),
@@ -3674,6 +3695,82 @@ mod tests {
         ));
 
         (backend, physics_world, world, ground, cube)
+    }
+
+    #[test]
+    fn sync_refreshes_snapshot_after_rejection_slot_reuse_and_joint_lifecycle() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+
+        let parent = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::cuboid(Vec3::splat(0.1)),
+                Transform3::IDENTITY,
+            ))
+            .id();
+        let child = world
+            .spawn((
+                RigidBody::default(),
+                Collider::cuboid(Vec3::splat(0.1)),
+                Transform3::from_translation_rotation(Vec3::Y, Quat::IDENTITY),
+            ))
+            .id();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        world.entity_mut(child).insert(RevoluteJointDesc {
+            parent,
+            axis: Vec3::Z,
+            anchor_parent_m: Vec3::Y,
+            anchor_child_m: Vec3::ZERO,
+            relative_rotation: Quat::IDENTITY,
+            lower_rad: None,
+            upper_rad: None,
+        });
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        assert!(backend
+            .world(physics_world)
+            .unwrap()
+            .entity_to_joint
+            .contains_key(&child));
+
+        world.entity_mut(child).remove::<RevoluteJointDesc>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        assert!(!backend
+            .world(physics_world)
+            .unwrap()
+            .entity_to_joint
+            .contains_key(&child));
+
+        let invalid = world
+            .spawn((
+                RigidBody::default(),
+                Collider::cuboid(Vec3::splat(0.1)),
+                CompoundCollider { parts: Vec::new() },
+                Transform3::IDENTITY,
+            ))
+            .id();
+        assert!(backend.sync_from_ecs(&mut world, physics_world).is_err());
+
+        assert!(world.despawn(invalid));
+        let replacement = world
+            .spawn((
+                RigidBody::default(),
+                Collider::cuboid(Vec3::splat(0.1)),
+                Transform3::from_translation_rotation(Vec3::X, Quat::IDENTITY),
+            ))
+            .id();
+        assert_eq!(replacement.index(), invalid.index());
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        let state = backend.world(physics_world).unwrap();
+        assert!(state.entity_to_body.contains_key(&replacement));
+        assert!(state.entity_snapshot.contains(&replacement));
+        assert!(!state.entity_snapshot.contains(&invalid));
     }
 
     /// Drives a motorised foot into a ground surface and reports its rest height.
