@@ -228,6 +228,38 @@ impl RapierBackend {
         self.worlds.get_mut(&id).ok_or(PhysicsError::WorldNotFound)
     }
 
+    /// Configures contact stabilization for a world's physical length scale.
+    ///
+    /// `allowed_penetration_m` is the penetration slop in metres, independent of
+    /// Rapier's length unit. Frequency and damping control contact compliance;
+    /// smaller colliders may need tighter slop and stiffer contacts than defaults.
+    /// Returns false without changing the world for an unknown world or invalid
+    /// parameters (non-finite, non-positive, greater than 1e6, or underflowing f32).
+    /// Existing worlds retain Rapier defaults unless this method is called.
+    pub fn set_contact_stabilization(
+        &mut self,
+        id: PhysicsWorldId,
+        allowed_penetration_m: f64,
+        natural_frequency_hz: f64,
+        damping_ratio: f64,
+    ) -> bool {
+        let values = [allowed_penetration_m, natural_frequency_hz, damping_ratio];
+        if values
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0 || *v > 1.0e6 || (*v as f32) == 0.0)
+        {
+            return false;
+        }
+        let Ok(state) = self.world_mut(id) else {
+            return false;
+        };
+        let params = &mut state.integration_parameters;
+        params.normalized_allowed_linear_error = allowed_penetration_m as f32 / params.length_unit;
+        params.contact_natural_frequency = natural_frequency_hz as f32;
+        params.contact_damping_ratio = damping_ratio as f32;
+        true
+    }
+
     /// Applies a velocity-equivalent disturbance to an entity's rigid body over the
     /// next physics step.
     ///
@@ -2146,6 +2178,45 @@ mod tests {
     use rne_ecs::spawn_named;
     use rne_math::Quat;
     use rne_physics::{hash_physics_state, ColliderShape, CollisionGroups};
+
+    #[test]
+    fn contact_stabilization_is_world_local_and_rejects_invalid_updates() {
+        let mut backend = RapierBackend::new();
+        let id = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let other = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        backend
+            .world_mut(id)
+            .unwrap()
+            .integration_parameters
+            .length_unit = 0.1;
+        assert!(backend.set_contact_stabilization(id, 0.00005, 300.0, 10.0));
+        let values = |backend: &RapierBackend| {
+            let p = &backend.world(id).unwrap().integration_parameters;
+            [
+                p.normalized_allowed_linear_error,
+                p.contact_natural_frequency,
+                p.contact_damping_ratio,
+            ]
+        };
+        let expected = values(&backend);
+        assert_relative_eq!(expected[0], 0.0005, epsilon = 1e-9);
+        assert_eq!([expected[1], expected[2]], [300.0, 10.0]);
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e7, f64::MIN_POSITIVE] {
+            assert!(!backend.set_contact_stabilization(id, bad, 300.0, 10.0));
+            assert!(!backend.set_contact_stabilization(id, 0.00005, bad, 10.0));
+            assert!(!backend.set_contact_stabilization(id, 0.00005, 300.0, bad));
+            assert_eq!(values(&backend), expected);
+        }
+        assert!(!backend.set_contact_stabilization(PhysicsWorldId(u32::MAX), 0.00005, 300.0, 10.0));
+        assert_eq!(
+            backend
+                .world(other)
+                .unwrap()
+                .integration_parameters
+                .contact_natural_frequency,
+            30.0
+        );
+    }
 
     fn owner_filter_fixture() -> (RapierBackend, PhysicsWorldId, World) {
         let mut backend = RapierBackend::new();

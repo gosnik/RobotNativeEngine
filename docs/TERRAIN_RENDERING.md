@@ -67,3 +67,21 @@ Before/after half-second headless hold runs on both Rough and Extreme had
 identical non-timing result fields and byte-identical joint, walking and stance
 telemetry, with zero faults and finite results. This checks the rendering-only
 integration's physics invariance; it is not a new gait or terrain qualification.
+
+## Small physical contacts
+
+Rendering LOD does not affect collision. Applications with millimetre-scale
+feet may need contact stabilization tighter than Rapier's metre-scale defaults.
+`RapierBackend::set_contact_stabilization(world, allowed_penetration_m,
+natural_frequency_hz, damping_ratio)` configures one world without changing its
+collider geometry, timestep, or iteration count. Invalid inputs leave it unchanged.
+Existing applications retain their original settings unless they opt in.
+
+Hexapod uses 0.00005 m penetration slop, 300 Hz frequency and damping ratio 5.
+An otherwise identical 30-second Extreme walking comparison reproduced trapped
+feet with defaults (minimum toe-centre vertical clearance -33.9 mm); with these
+settings no toe centre crossed below the terrain. Both runs stayed finite and
+upright. This is bounded regression evidence, not a guarantee for arbitrary
+loads, impact speeds or timestep sizes. Loaded small-sphere tests cover both
+heightfields and boxes; decreasing timestep should still be checked for a new
+robot or operating envelope.
