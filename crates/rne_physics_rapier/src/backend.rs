@@ -817,6 +817,9 @@ impl PhysicsBackend for RapierBackend {
         state.completed_position_motor_diagnostics.clear();
 
         advance_rapier_pipeline(state);
+        // `PhysicsPipeline::step` incrementally refreshes this pipeline after
+        // final collider positions, so rebuilding it here would duplicate that
+        // work and is unnecessary before queries.
 
         state.completed_joint_efforts = std::mem::take(&mut state.pending_joint_efforts);
         #[cfg(feature = "position-motor-diagnostics")]
@@ -831,8 +834,6 @@ impl PhysicsBackend for RapierBackend {
                 body.reset_torques(true);
             }
         }
-
-        state.query_pipeline.update(&state.colliders);
 
         for contact_pair in state.narrow_phase.contact_pairs() {
             if !contact_pair.has_any_active_contact {
@@ -4576,6 +4577,49 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity, ground);
         assert_relative_eq!(hits[0].point_m.y, 0.0, epsilon = 0.1);
+    }
+
+    #[test]
+    fn raycast_tracks_dynamic_body_motion_immediately_after_step() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend
+            .create_world(PhysicsWorldDesc {
+                gravity_m_s2: Vec3::ZERO,
+                solver_iterations: 4,
+            })
+            .unwrap();
+        let mut world = World::new();
+        let moving = world
+            .spawn((
+                RigidBody {
+                    linear_velocity_m_s: Vec3::X * 120.0,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.25),
+                Transform3::IDENTITY,
+            ))
+            .id();
+
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        backend.step(physics_world, fixed_step()).unwrap();
+
+        let moved_hits = backend
+            .raycast(
+                physics_world,
+                RaycastQuery::downward(Vec3::new(2.0, 1.0, 0.0), 2.0),
+            )
+            .unwrap();
+        assert_eq!(moved_hits.len(), 1);
+        assert_eq!(moved_hits[0].entity, moving);
+        assert_relative_eq!(moved_hits[0].distance_m, 0.75, epsilon = 1e-5);
+        assert_relative_eq!(moved_hits[0].point_m.y, 0.25, epsilon = 1e-5);
+        assert!(backend
+            .raycast(
+                physics_world,
+                RaycastQuery::downward(Vec3::new(0.0, 1.0, 0.0), 2.0),
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -74,3 +74,33 @@ microseconds after (55.4% less time). The complete headless update
 before and 182.696 microseconds after (43.3% less time), also the median of
 five alternating runs. Wall-clock results vary by host and load.
 The repository-pinned Rust 1.95.0 toolchain was unavailable on this host.
+
+## Incremental post-step queries
+
+`advance_rapier_pipeline` passes the backend's query pipeline to Rapier's
+`PhysicsPipeline::step`, which updates it incrementally after advancing collider
+positions. The backend therefore does not perform another full QBVH rebuild
+immediately afterward. The full update after `sync_from_ecs` remains necessary
+for externally changed collider state. A regression test queries a moving body
+immediately after stepping, before any further ECS synchronization.
+
+This follows Box3D's use of tracked moved proxies in
+[`b3World_Step`](https://github.com/erincatto/box3d/blob/efca0c184d40fd6a82016983f1601c4d23965867/src/physics_world.c)
+to update its spatial data, instead of redundantly rebuilding it. RNE continues
+to use Rapier's query implementation and does not change collision or solver
+settings.
+
+The `step_with_many_moving_colliders` and
+`headless_step_with_many_moving_colliders` ignored tests in `sync_benchmark.rs`
+measure 1,024 moving colliders. The separate regression test checks post-step
+raycast freshness and hit distance. Run the timing probes with the
+same release command above and compare against the preceding synchronization
+optimization (`46a28d2`), using the same fixture in both checkouts.
+
+On the same CPU and Rust 1.98.1 release configuration, five alternating runs
+measured median physics-step time of 432.712 microseconds before and 412.142
+microseconds after (4.75% less time). Median complete-tick time fell from
+591.904 to 567.216 microseconds (4.17% less time). The benchmark uses eight
+warmup steps and 64 measured steps at 60 Hz, zero gravity, and separated moving
+boxes. These are incremental gains over `46a28d2`, not percentages to add to
+the earlier benchmark's results or predictions for Hexapod.
