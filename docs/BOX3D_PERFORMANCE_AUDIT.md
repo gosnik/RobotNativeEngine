@@ -25,7 +25,7 @@ and fixture details are in [BENCHMARKS.md](BENCHMARKS.md).
 | Technique | Evidence and disposition |
 | --- | --- |
 | Dense work subsets | Accepted: select physics-relevant ECS archetypes before deterministic sorting. Against `f4a660e`, synchronization took 86.1% less time and complete ticks 53.7% less in the mixed-entity fixture. New archetypes and malformed standalone controls have regression coverage. |
-| Reuse sensor queries | Box3D `sensor.c` retains per-worker sensor data. RNE LiDAR repeats its central ray when sampling a beam footprint; reuse is under measurement. |
+| Reuse sensor queries | Accepted: reuse LiDAR's central hit list for footprint sample zero. A 64-ray, 16-sample scan consistently avoids 64 queries and their result allocations (1,088 -> 1,024). Synthetic timings are documented separately from this exact operation-count result. |
 | Dirty spatial updates | Box3D `broad_phase.c` tracks moved proxies. Rapier already updates moved colliders; remaining pre-step rebuilds need a lifecycle audit. |
 | Force bookkeeping | Box3D uses membership flags/bitsets instead of repeatedly searching work lists. RNE's forced-body list and effort buffers remain candidates. |
 | Transform and joint metadata reuse | Box3D prepares invariant solver data before repeated work. RNE's hierarchy walks and joint degree-of-freedom offsets remain candidates. |

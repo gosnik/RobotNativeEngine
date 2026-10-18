@@ -121,3 +121,24 @@ Against `f4a660e`, five alternating release runs of the same 128-body plus
 ranges were 111.179–114.090 and 15.546–15.773 microseconds. This improvement is
 largest in scenes with many non-physics entities; it is not a Hexapod-specific
 timing claim.
+
+## Reusing LiDAR's central beam query
+
+For a divergent beam with multiple footprint samples, `evaluate_ray` already
+has the central hit list. Footprint sample zero now borrows that list instead
+of casting the identical ray again. Divergent samples, RNG slots, range
+filtering, weighting, and scan failure handling are unchanged. Single-sample
+and zero-divergence scans keep their existing behavior.
+
+```sh
+cargo test -p rne_sensor --release --test lidar_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+This explicitly synthetic immutable-raycaster fixture performs 64 rays with
+16 beam samples. It now makes exactly 1,024 queries instead of 1,088, removing
+64 queries and their result allocations (5.9%). Five alternating release runs
+measured median scan time of 63.717 -> 57.845 microseconds; timing ranges overlap,
+so the deterministic query-count reduction is the primary evidence. The regular
+beam-footprint regression checks the exact new query count and mixed-edge result.
+This change benefits LiDAR callers; the current Hexapod contact simulation does
+not itself scan LiDAR.
