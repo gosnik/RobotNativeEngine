@@ -835,7 +835,11 @@ impl PhysicsBackend for RapierBackend {
         // final collider positions, so rebuilding it here would duplicate that
         // work and is unnecessary before queries.
 
-        state.completed_joint_efforts = std::mem::take(&mut state.pending_joint_efforts);
+        std::mem::swap(
+            &mut state.completed_joint_efforts,
+            &mut state.pending_joint_efforts,
+        );
+        state.pending_joint_efforts.clear();
         #[cfg(feature = "position-motor-diagnostics")]
         collect_completed_position_motor_diagnostics(state, dt);
 
@@ -3062,6 +3066,13 @@ mod tests {
                 assert!(
                     matches!(world.get::<JointEffortMeasurement>(child), Some(JointEffortMeasurement::Revolute { measured_effort_nm }) if *measured_effort_nm == 2.0)
                 );
+                // Without a new sync/command, later completed steps must not
+                // republish the previous effort from either retained buffer.
+                for _ in 0..3 {
+                    backend.step(id, fixed_step()).unwrap();
+                    backend.sync_to_ecs(&mut world, id).unwrap();
+                    assert!(world.get::<JointEffortMeasurement>(child).is_none());
+                }
             }
         }
         let (mut backend, id, mut world, child) = motor_diagnostic_fixture(true, 10.0, 2.0);

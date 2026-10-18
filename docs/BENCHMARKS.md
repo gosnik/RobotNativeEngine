@@ -177,3 +177,19 @@ Sync ranges were 89.278–90.015 and 66.549–68.606. At 18 joints, sync medians
 were 6.519 -> 6.447 and full ticks 57.326 -> 57.167 microseconds; differences
 are within noise, so no small-robot speedup is claimed. All five final hashes
 matched across implementations at both sizes. The backend tests passed.
+
+## Reusing completed-effort buffers
+
+Swapping the pending/completed effort maps and clearing the old completed map
+retains their allocations while preserving one-step publication. The feedback
+regression also advances three times without another command and checks that
+old measurements never reappear. This applies the general scratch-reuse
+principle; Box3D does not have this robot-specific feedback lifecycle.
+
+Against `af59fb9`, five alternating runs of `effort_benchmark` measured 18-joint
+sync 6.360 -> 5.968 microseconds (6.2% less) and 256-joint sync
+66.738 -> 63.032 microseconds (5.6% less). Sync ranges were 6.286–6.380 versus
+5.884–5.993, and 65.700–66.955 versus 61.350–63.710. Complete-tick ranges
+overlap at both sizes (medians 56.972 -> 57.391 and 649.576 -> 639.065),
+so the claim is reduced allocation/synchronization work rather than a robust
+end-to-end speedup. Final state hashes matched at both sizes in every run.
