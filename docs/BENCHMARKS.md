@@ -225,3 +225,34 @@ were 2.165 -> 2.148 microseconds, within noise. The fixture deliberately omits
 explicit passive damping; imported robots that supply damping, including
 Hexapod, do not benefit from this shortcut. Default and all-feature backend
 tests passed.
+
+## Opt-in SIMD contact solving
+
+Box3D's wide contact batches motivate exposing Rapier's existing stable SIMD
+solver through `rne_physics_rapier/simd`. This feature remains opt-in: scalar
+and vectorized arithmetic need not agree on arbitrary scenes, and Rapier
+rejects combining SIMD with `enhanced-determinism`. Keep feature configuration
+and target environment fixed for replay comparisons.
+
+```sh
+cargo test -p rne_physics_rapier --release --test contact_benchmark -- --ignored --nocapture
+cargo test -p rne_physics_rapier --release --features simd --test contact_benchmark -- --ignored --nocapture
+```
+
+Build these into separate target directories before timing. The public-API
+fixture has 256 frictionless boxes sliding on a floor, 16 warmup steps and
+128 measured steps at 60 Hz. Five alternating runs measured scalar
+518.910 versus SIMD 362.659 microseconds per physics step (30.1% less).
+Ranges were 510.221–531.297 and 352.922–376.851. Every run had 256 contacts
+and final state hash `eeab673517191700`. The full 80-test all-feature backend
+suite passed with SIMD enabled. This fixture does not establish a Hexapod
+performance gain.
+
+Hexapod compatibility was checked with three alternating scalar/SIMD pairs
+each of two-second hold and walk runs using the same immutable model and
+configuration. All non-timing result fields and joint, walking, and stance
+telemetry matched exactly; all runs were finite with zero faults and no falls.
+Physics-step medians were 2.040 versus 2.043 seconds for hold and 2.030 versus
+2.029 seconds for walk, with overlapping ranges. Thus SIMD is compatible in
+these smoke scenarios, with no demonstrated robot-specific speedup. These
+short runs are not a gait qualification.

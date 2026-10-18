@@ -29,11 +29,18 @@ and fixture details are in [BENCHMARKS.md](BENCHMARKS.md).
 | Dirty spatial updates | Accepted: rebuild the pre-step query tree only after collider insertion/removal. Rapier incrementally maintains moving proxies during stepping. Lifecycle regressions cover removal, same-index replacement, and recovery after failed synchronization; mixed-scene sync fell 29.9% and full ticks 5.2%. |
 | Force bookkeeping | Accepted: eliminate quadratic membership scans in direct-effort cleanup, using Rapier's idempotent resets and preserving append order. 256-joint sync fell 24.9%; 18-joint timing was unchanged within noise. Accepted separately: retain alternating effort-map allocations, reducing measured sync by 6.2% at 18 joints and 5.6% at 256 joints; full-tick timing overlaps. This is a wrapper-specific application of avoiding repeated work, not a port of Box3D's force lifecycle. |
 | Transform and joint metadata reuse | Accepted: skip unused hierarchy walks for existing physics-owned poses. The 128-body sync fixture improved 34.5% at depth one and 83.2% at depth sixteen. This is wrapper-specific elimination of unused work, not a Box3D articulation algorithm. Accepted separately: calculate assembly offsets only when consumed by explicit damping or armature; the default-feature 128-link no-damping fixture improved 25.6%. Imported robots with explicit damping do not benefit. |
-| SIMD | Rapier's optional `simd-stable` feature passes the 75-test baseline suite. A 256-contact sliding-box probe measured 508.073 -> 354.229 microseconds per step with identical final state hashes across five alternating runs. Hexapod compatibility remains to be evaluated before enabling it. |
+| SIMD | Accepted as opt-in `simd`: 80 all-feature tests pass. The 256-contact fixture measured 518.910 -> 362.659 microseconds per step (30.1% less), with identical hashes and contact counts. Three pairs each of Hexapod hold/walk runs matched non-timing results and telemetry exactly; robot timings overlap. SIMD stays optional to preserve scalar/enhanced-determinism configurations. |
 | Parallel solver | Vendored parallel solver module wiring is commented out. Enabling the Cargo feature alone is not an implementation; enabling it requires a separate solver/telemetry compatibility project. |
 | Sleeping | Rapier already owns active islands and sleeping. Skipping wrapper updates merely because a body sleeps could suppress commanded motion or forces; no such shortcut is accepted. |
 | Contact buffers | RNE already clears and reuses contact/event vectors, and exposes borrowed slices. Hexapod consumes current point-level contact data; suppressing publication would change behavior. |
 | Batch raycasts | Not pursued: a native override only hoists the world lookup; the sensor raycaster abstraction has no batch entry point, and Box3D provides no transferable batch traversal primitive. Meaningful batching requires a separate sensor/query API design with error and order conformance tests. Central-ray reuse already removes actual traversal/allocation work without that change. |
+
+## Audit outcome
+
+Every candidate in this inventory has an accepted, rejected, already-provided,
+or separate-project disposition. No remaining measured wrapper candidate is
+being deferred. This closes this pass over the identified Box3D techniques;
+it does not claim that all possible future optimizations are exhausted.
 
 ## Solver internals inspected
 
