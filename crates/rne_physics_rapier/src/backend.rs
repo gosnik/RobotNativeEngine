@@ -1432,10 +1432,31 @@ fn normalized_axis(axis: Vec3) -> Unit<Vector3<f32>> {
 
 /// Refreshes the deterministic entity snapshot shared by an ECS-to-Rapier sync.
 fn refresh_entity_snapshot(world: &World, state: &mut RapierWorldState) {
+    // Every consumer of this snapshot only inspects one of these components.
+    // Selecting their archetypes avoids repeatedly visiting arbitrary scene,
+    // rendering, and gameplay entities during each fixed physics tick. Component
+    // ids and archetypes are inspected afresh because either may change between
+    // synchronizations as components are inserted or removed.
+    let relevant_components = [
+        world.component_id::<RigidBody>(),
+        world.component_id::<RevoluteJointDesc>(),
+        world.component_id::<PrismaticJointDesc>(),
+        world.component_id::<FixedJointDesc>(),
+        world.component_id::<RevoluteJointArmature>(),
+        world.component_id::<JointActuation>(),
+        world.component_id::<JointPassiveDynamics>(),
+    ];
     state.entity_snapshot.clear();
-    state
-        .entity_snapshot
-        .extend(world.iter_entities().map(|entity| entity.id()));
+    for archetype in world.archetypes().iter().filter(|archetype| {
+        relevant_components
+            .iter()
+            .flatten()
+            .any(|component| archetype.contains(*component))
+    }) {
+        state
+            .entity_snapshot
+            .extend(archetype.entities().iter().map(|entity| entity.id()));
+    }
     state.entity_snapshot.sort_unstable();
 }
 
@@ -3772,6 +3793,75 @@ mod tests {
         assert!(state.entity_to_body.contains_key(&replacement));
         assert!(state.entity_snapshot.contains(&replacement));
         assert!(!state.entity_snapshot.contains(&invalid));
+    }
+
+    #[test]
+    fn filtered_snapshot_tracks_relevant_archetype_additions_and_removals() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+
+        let unrelated = world.spawn_empty().id();
+        let rigid_body = world
+            .spawn((RigidBody::default(), Transform3::IDENTITY))
+            .id();
+        let joint = world.spawn(JointActuation::Disabled).id();
+
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        let snapshot = &backend.world(physics_world).unwrap().entity_snapshot;
+        assert_eq!(snapshot, &vec![rigid_body, joint]);
+        assert!(!snapshot.contains(&unrelated));
+
+        world.entity_mut(unrelated).insert(FixedJointDesc {
+            parent: rigid_body,
+            anchor_parent_m: Vec3::ZERO,
+            anchor_child_m: Vec3::ZERO,
+            relative_rotation: Quat::IDENTITY,
+        });
+        world.entity_mut(rigid_body).remove::<RigidBody>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        let snapshot = &backend.world(physics_world).unwrap().entity_snapshot;
+        assert_eq!(snapshot, &vec![unrelated, joint]);
+    }
+
+    #[test]
+    fn filtered_snapshot_keeps_standalone_control_validation() {
+        let invalid_world = |component: Box<dyn FnOnce(&mut World)>| {
+            let mut backend = RapierBackend::new();
+            let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+            let mut world = World::new();
+            component(&mut world);
+            backend.sync_from_ecs(&mut world, physics_world)
+        };
+
+        assert!(matches!(
+            invalid_world(Box::new(|world| {
+                world.spawn(JointActuation::RevoluteEffort {
+                    effort_nm: 1.0,
+                    max_effort_nm: 1.0,
+                });
+            })),
+            Err(PhysicsError::InvalidActuation { .. })
+        ));
+        assert!(matches!(
+            invalid_world(Box::new(|world| {
+                world.spawn(JointPassiveDynamics::Revolute {
+                    viscous_damping_nm_s_per_rad: 0.0,
+                    coulomb_friction_nm: 1.0,
+                    coulomb_transition_velocity_rad_s: 1.0,
+                });
+            })),
+            Err(PhysicsError::InvalidPassiveDynamics { .. })
+        ));
+        assert!(matches!(
+            invalid_world(Box::new(|world| {
+                world.spawn(RevoluteJointArmature {
+                    inertia_kg_m2: -1.0,
+                });
+            })),
+            Err(PhysicsError::InvalidPassiveDynamics { .. })
+        ));
     }
 
     /// Drives a motorised foot into a ground surface and reports its rest height.

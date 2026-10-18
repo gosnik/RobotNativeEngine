@@ -38,7 +38,7 @@ For the full capability, conformance, benchmark, and Failure Capsule gate, run
 
 ## Rapier synchronization scratch storage
 
-The Rapier backend builds one sorted entity snapshot per `sync_from_ecs` call
+The Rapier backend builds one sorted physics-relevant entity snapshot per `sync_from_ecs` call
 and shares it across body, joint, attachment, motor, and diagnostic passes.
 Its backing allocation is retained between calls. The snapshot is rebuilt on
 every call so spawning, despawning, and component changes remain visible; it
@@ -104,3 +104,20 @@ microseconds after (4.75% less time). Median complete-tick time fell from
 warmup steps and 64 measured steps at 60 Hz, zero gravity, and separated moving
 boxes. These are incremental gains over `46a28d2`, not percentages to add to
 the earlier benchmark's results or predictions for Hexapod.
+
+## Physics-relevant archetype selection
+
+Following Box3D's dense solver work sets, the backend now selects only archetypes
+containing body, joint-description, armature, actuation, or passive-dynamics
+components before sorting the shared snapshot. Component IDs and archetypes are
+rechecked each call, so new components/archetypes and standalone malformed
+controls remain visible. Unrelated rendering/gameplay entities skip all six
+physics passes without changing the order of relevant entities.
+
+Against `f4a660e`, five alternating release runs of the same 128-body plus
+4,096-background-entity fixture measured median synchronization time of
+112.335 -> 15.585 microseconds (86.1% less), and complete-tick time of
+179.451 -> 83.173 microseconds (53.7% less). The before/after synchronization
+ranges were 111.179–114.090 and 15.546–15.773 microseconds. This improvement is
+largest in scenes with many non-physics entities; it is not a Hexapod-specific
+timing claim.
