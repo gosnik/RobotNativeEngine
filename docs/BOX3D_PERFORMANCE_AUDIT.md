@@ -66,3 +66,12 @@ The existing workspace Clippy gate reports `chunks_exact_to_as_chunks` in
 untouched code under this newer toolchain. Targeted tests and headless CI are
 reported separately from that gate. Hexapod integration verifies its engine
 pin, viewer-enabled release build, and an explicit-snapshot headless run.
+
+Final broad validation: `xtask ci-headless` passed. Workspace tests reached
+13 failing `xtask` historical-provenance checks because the imported fork does
+not have the recorded release baseline revisions as ancestors. Fetching the
+missing historical objects resolved object lookup but not that ancestry
+requirement. No history was rewritten to bypass it. Full Clippy/`xtask ci` also
+remain blocked by pre-existing newer-toolchain lints in untouched USD, data and
+render cache code. Targeted changed-crate tests and Clippy (allowing only the
+known `chunks_exact_to_as_chunks` lint) are reported separately.

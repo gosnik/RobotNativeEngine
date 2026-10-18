@@ -21,6 +21,7 @@ wgpu = "24"
 winit = { workspace = true, optional = true }
 
 [dev-dependencies]
+image = { workspace = true }
 naga = "24"
 approx = "0.5"
 rne_ecs = { workspace = true }

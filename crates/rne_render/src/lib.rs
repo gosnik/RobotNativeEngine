@@ -56,3 +56,7 @@ pub use pass::CameraPassOutput;
 pub use path::resolve_package_uri;
 pub use scene::{RenderScene, RenderSceneItem};
 pub use visual::{LinkVisuals, Visual, VisualShape};
+
+/// Precision-preserving heightmaps and cached terrain mesh LOD.
+pub mod terrain;
+pub use terrain::{TerrainError, TerrainHeightMap, TerrainMesh};
