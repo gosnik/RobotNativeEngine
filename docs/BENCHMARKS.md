@@ -160,3 +160,20 @@ The 1,024-moving-collider full-tick median was 542.906 -> 519.932 microseconds
 (4.2% less), with overlapping ranges 534.712–574.596 and 512.205–545.840.
 These are the existing `sync_benchmark` fixtures; 80 all-feature backend tests
 passed. No Hexapod-specific speedup is inferred from these scene timings.
+
+## Linear direct-effort cleanup bookkeeping
+
+Direct efforts now append bodies to the ordered cleanup list without searching
+the entire list first. Rapier's force/torque reset is a no-op after the first
+reset, so repeated entries preserve results; external wrenches already use this
+append policy. This removes quadratic wrapper bookkeeping for large joint sets.
+
+Run `cargo test -p rne_physics_rapier --release --test effort_benchmark --
+--ignored --nocapture`. The fixture has 18 or 256 independent impulse joints,
+16 warmup ticks and 256 measured ticks at 1 kHz. Five alternating runs against
+`fa71d4b` measured 256-joint sync 89.606 -> 67.310 microseconds (24.9% less),
+and complete ticks 672.521 -> 651.851 microseconds (3.1% less; ranges overlap).
+Sync ranges were 89.278–90.015 and 66.549–68.606. At 18 joints, sync medians
+were 6.519 -> 6.447 and full ticks 57.326 -> 57.167 microseconds; differences
+are within noise, so no small-robot speedup is claimed. All five final hashes
+matched across implementations at both sizes. The backend tests passed.

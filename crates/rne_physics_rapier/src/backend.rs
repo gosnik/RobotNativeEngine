@@ -2034,9 +2034,9 @@ fn apply_generalized_effort(
                 measured = Some(f64::from((body.user_force() - before).dot(&axis)));
             }
         }
-        if !state.impulse_forced.contains(&handle) {
-            state.impulse_forced.push(handle);
-        }
+        // Clearing a body's force twice is a no-op. Keep append order and avoid
+        // a linear membership scan for every effort applied to a large robot.
+        state.impulse_forced.push(handle);
     }
     measured.ok_or_else(|| invalid_actuation(entity, "dynamic child did not accept joint effort"))
 }
