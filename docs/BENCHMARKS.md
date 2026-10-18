@@ -208,3 +208,20 @@ sync 14.054 -> 9.207 microseconds (34.5% less; ranges 13.935–14.298 and
 (83.2% less; ranges 54.174–55.141 and 9.131–9.277). This deliberately isolates
 unused hierarchy walks; it is not a full-tick or Hexapod speedup claim.
 Backend tests, including physics-owned pose behavior, passed.
+
+## Avoiding unused joint offsets
+
+In builds without experimental armature, synchronization computes a joint's
+assembly offset only when an explicit passive-damping component needs it.
+Armature builds and joints with explicit damping retain the existing calculation
+and validation order. This is local elimination of unused metadata work, not
+a Box3D multibody algorithm.
+
+Run `cargo test -p rne_physics_rapier --release --test joint_metadata_benchmark
+-- --ignored --nocapture` with default features. Against `4fad9d4`, five
+alternating runs measured 128-link sync 19.515 -> 14.528 microseconds
+(25.6% less; ranges 19.310–19.748 and 14.232–14.793). At 18 links, medians
+were 2.165 -> 2.148 microseconds, within noise. The fixture deliberately omits
+explicit passive damping; imported robots that supply damping, including
+Hexapod, do not benefit from this shortcut. Default and all-feature backend
+tests passed.

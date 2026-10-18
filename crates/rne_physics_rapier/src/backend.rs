@@ -1682,6 +1682,7 @@ fn apply_joint_motors(world: &World, state: &mut RapierWorldState) -> Result<(),
         let Some((multibody, link_id)) = state.multibody_joints.get_mut(*joint_handle) else {
             continue;
         };
+        #[cfg(feature = "experimental-armature")]
         let assembly_id = multibody
             .links()
             .take(link_id)
@@ -1707,6 +1708,12 @@ fn apply_joint_motors(world: &World, state: &mut RapierWorldState) -> Result<(),
             }
         }
         if let Some(damping) = passive_viscous_damping(world, *entity)? {
+            #[cfg(not(feature = "experimental-armature"))]
+            let assembly_id = multibody
+                .links()
+                .take(link_id)
+                .map(|link| link.joint.ndofs())
+                .sum::<usize>();
             multibody.damping_mut()[assembly_id] = damping as f32;
         }
         let Some(link) = multibody.link_mut(link_id) else {
