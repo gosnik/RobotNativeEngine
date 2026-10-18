@@ -193,3 +193,18 @@ sync 6.360 -> 5.968 microseconds (6.2% less) and 256-joint sync
 overlap at both sizes (medians 56.972 -> 57.391 and 649.576 -> 639.065),
 so the claim is reduced allocation/synchronization work rather than a robust
 end-to-end speedup. Final state hashes matched at both sizes in every run.
+
+## Skipping unused physics-owned transforms
+
+Existing `PhysicsOwnedPose` bodies no longer walk ECS parent chains and convert
+isometries whose results were discarded. Initial body creation and ordinary
+ECS-driven bodies still compute their transforms. Collider synchronization is
+unchanged. Run `cargo test -p rne_physics_rapier --release --test
+owned_pose_benchmark -- --ignored --nocapture`.
+
+Against `26b6b88`, five alternating runs with 128 bodies measured depth-one
+sync 14.054 -> 9.207 microseconds (34.5% less; ranges 13.935–14.298 and
+9.007–9.303), and depth-sixteen sync 55.085 -> 9.237 microseconds
+(83.2% less; ranges 54.174–55.141 and 9.131–9.277). This deliberately isolates
+unused hierarchy walks; it is not a full-tick or Hexapod speedup claim.
+Backend tests, including physics-owned pose behavior, passed.

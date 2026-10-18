@@ -716,9 +716,6 @@ impl PhysicsBackend for RapierBackend {
                 continue;
             }
 
-            let transform = world_transform_of(world, entity);
-            let isometry = transform_to_isometry(&transform);
-
             if let Some(body_handle) = state.entity_to_body.get(&entity).copied() {
                 // A marked reduced-coordinate member's pose and velocity are
                 // owned by its multibody assembly (root pose + joint state).
@@ -729,6 +726,8 @@ impl PhysicsBackend for RapierBackend {
                 let physics_owned = world.get::<PhysicsOwnedPose>(entity).is_some();
                 if let Some(body) = state.bodies.get_mut(body_handle) {
                     if !physics_owned {
+                        let transform = world_transform_of(world, entity);
+                        let isometry = transform_to_isometry(&transform);
                         if rigid_body.body_type == RigidBodyType::Kinematic
                             && world.get::<CommandedKinematicPose>(entity).is_some()
                         {
@@ -754,6 +753,8 @@ impl PhysicsBackend for RapierBackend {
                 continue;
             }
 
+            let transform = world_transform_of(world, entity);
+            let isometry = transform_to_isometry(&transform);
             let mut builder =
                 RigidBodyBuilder::new(body_type_to_rapier(rigid_body.body_type)).position(isometry);
             if let Some(scale) = world.get::<GravityScale>(entity) {
