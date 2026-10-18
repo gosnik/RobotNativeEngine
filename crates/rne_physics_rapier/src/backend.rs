@@ -80,6 +80,9 @@ struct RapierWorldState {
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
     query_pipeline: QueryPipeline,
+    /// A collider was inserted or removed since the query pipeline was last
+    /// fully rebuilt, so direct queries after synchronization need a rebuild.
+    query_pipeline_needs_rebuild: bool,
     entity_to_body: HashMap<Entity, RigidBodyHandle>,
     body_to_entity: HashMap<RigidBodyHandle, Entity>,
     entity_to_collider: HashMap<Entity, ColliderHandle>,
@@ -625,6 +628,7 @@ impl PhysicsBackend for RapierBackend {
                 multibody_joints: MultibodyJointSet::new(),
                 ccd_solver: CCDSolver::new(),
                 query_pipeline: QueryPipeline::new(),
+                query_pipeline_needs_rebuild: false,
                 entity_to_body: HashMap::new(),
                 body_to_entity: HashMap::new(),
                 entity_to_collider: HashMap::new(),
@@ -702,7 +706,13 @@ impl PhysicsBackend for RapierBackend {
                     return Err(PhysicsError::InitializationFailed);
                 }
             }
-            if collider.is_none() && world.get::<MultibodyLink>(entity).is_none() {
+            // Existing bodies must still visit `sync_entity_collider` when the
+            // collider component was removed. New collider-free plain bodies
+            // remain outside the native world as before.
+            if collider.is_none()
+                && world.get::<MultibodyLink>(entity).is_none()
+                && !state.entity_to_body.contains_key(&entity)
+            {
                 continue;
             }
 
@@ -795,6 +805,7 @@ impl PhysicsBackend for RapierBackend {
                 );
                 state.entity_to_collider.insert(entity, collider_handle);
                 state.collider_to_entity.insert(collider_handle, entity);
+                state.query_pipeline_needs_rebuild = true;
             }
             sync_collider_owner(world, state, entity);
         }
@@ -803,7 +814,10 @@ impl PhysicsBackend for RapierBackend {
         apply_joint_motors(world, state)?;
         #[cfg(feature = "position-motor-diagnostics")]
         sync_position_motor_diagnostic_targets(world, state);
-        state.query_pipeline.update(&state.colliders);
+        if state.query_pipeline_needs_rebuild {
+            state.query_pipeline.update(&state.colliders);
+            state.query_pipeline_needs_rebuild = false;
+        }
 
         Ok(())
     }
@@ -1219,6 +1233,7 @@ fn sync_entity_collider(
             );
             state.entity_to_collider.insert(entity, handle);
             state.collider_to_entity.insert(handle, entity);
+            state.query_pipeline_needs_rebuild = true;
         }
         (Some(handle), Some(collider)) => {
             if let Some(existing) = state.colliders.get_mut(handle) {
@@ -1233,6 +1248,7 @@ fn sync_entity_collider(
             state.collider_to_entity.remove(&handle);
             state.entity_to_collider.remove(&entity);
             state.collider_owners.remove(&handle);
+            state.query_pipeline_needs_rebuild = true;
         }
         (None, None) => {}
     }
@@ -1287,6 +1303,7 @@ fn remove_stale_owned_colliders(world: &World, state: &mut RapierWorldState) {
         state.collider_owners.remove(&handle);
         state.collider_to_entity.remove(&handle);
         state.entity_to_collider.remove(&entity);
+        state.query_pipeline_needs_rebuild = true;
     }
 }
 
@@ -4748,6 +4765,140 @@ mod tests {
         assert_eq!(hits[0].entity, near);
         assert_eq!(hits[1].entity, far);
         assert!(hits[0].distance_m < hits[1].distance_m);
+    }
+
+    #[test]
+    fn raycast_is_empty_immediately_after_collider_removal_sync() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+        let body = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                Transform3::from_translation_rotation(Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        world.entity_mut(body).remove::<Collider>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        assert!(backend
+            .raycast(
+                physics_world,
+                RaycastQuery {
+                    origin_m: Vec3::ZERO,
+                    direction: Vec3::X,
+                    max_distance_m: 10.0,
+                },
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn raycast_uses_owned_collider_replacement_after_one_sync() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+        let owner = world.spawn_empty().id();
+        let old = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                SelfCollisionExclusion { owner },
+                Transform3::from_translation_rotation(Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        assert!(world.despawn(old));
+        let replacement = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                Transform3::from_translation_rotation(Vec3::new(6.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+        assert_eq!(replacement.index(), old.index());
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        let hits = backend
+            .raycast(
+                physics_world,
+                RaycastQuery {
+                    origin_m: Vec3::ZERO,
+                    direction: Vec3::X,
+                    max_distance_m: 10.0,
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity, replacement);
+        assert!(hits[0].distance_m > 5.0);
+    }
+
+    #[test]
+    fn failed_sync_keeps_new_collider_query_rebuild_pending() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+        let added = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                Transform3::from_translation_rotation(Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+        let invalid = world
+            .spawn((
+                RigidBody::default(),
+                Collider::sphere(0.5),
+                CompoundCollider { parts: Vec::new() },
+                Transform3::IDENTITY,
+            ))
+            .id();
+
+        assert!(backend.sync_from_ecs(&mut world, physics_world).is_err());
+        assert!(
+            backend
+                .world(physics_world)
+                .unwrap()
+                .query_pipeline_needs_rebuild
+        );
+
+        world.entity_mut(invalid).remove::<CompoundCollider>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        assert!(
+            !backend
+                .world(physics_world)
+                .unwrap()
+                .query_pipeline_needs_rebuild
+        );
+        let hits = backend
+            .raycast(
+                physics_world,
+                RaycastQuery {
+                    origin_m: Vec3::ZERO,
+                    direction: Vec3::X,
+                    max_distance_m: 10.0,
+                },
+            )
+            .unwrap();
+        assert!(hits.iter().any(|hit| hit.entity == added));
     }
 
     #[test]

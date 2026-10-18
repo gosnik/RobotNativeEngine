@@ -142,3 +142,21 @@ so the deterministic query-count reduction is the primary evidence. The regular
 beam-footprint regression checks the exact new query count and mixed-edge result.
 This change benefits LiDAR callers; the current Hexapod contact simulation does
 not itself scan LiDAR.
+
+## Structural query invalidation
+
+Following Box3D's moved-proxy bookkeeping, synchronization now rebuilds the
+query tree only after collider insertion/removal. Ordinary simulation steps
+already update the tree incrementally. The dirty flag survives failed syncs.
+Regression coverage includes direct queries after removal, owned collider
+replacement with a reused entity index, and failed-sync recovery. This also
+fixes an existing early return that skipped removal of ordinary ECS colliders.
+
+Against `7201043`, five alternating release runs measured mixed-scene sync
+15.551 -> 10.896 microseconds (29.9% less) and full ticks
+82.619 -> 78.349 microseconds (5.2% less). Sync ranges were 15.365–15.762
+and 10.798–11.032; full-tick ranges were 82.342–82.867 and 78.238–79.104.
+The 1,024-moving-collider full-tick median was 542.906 -> 519.932 microseconds
+(4.2% less), with overlapping ranges 534.712–574.596 and 512.205–545.840.
+These are the existing `sync_benchmark` fixtures; 80 all-feature backend tests
+passed. No Hexapod-specific speedup is inferred from these scene timings.
