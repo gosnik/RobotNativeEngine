@@ -2857,6 +2857,13 @@ fn upload_texture_impl(
     format: wgpu::TextureFormat,
     options: TextureUploadOptions,
 ) -> GpuTexture {
+    // Renderer input can originate outside `PbrMaterial::sanitized` (notably
+    // base-color maps), so never let malformed RGBA bytes reach mip generation
+    // or `write_texture`. A white texel is the same visual fallback used for a
+    // missing base-color texture.
+    let fallback_image =
+        (!image_is_valid(image)).then(|| ImageFrame::from_rgba8(1, 1, vec![255, 255, 255, 255]));
+    let image = fallback_image.as_ref().unwrap_or(image);
     let mip_chain = options
         .generate_mips
         .then(|| build_mip_chain(image, format == wgpu::TextureFormat::Rgba8UnormSrgb));
@@ -2960,6 +2967,16 @@ fn upload_texture_impl(
         sampler,
         _bind_group: bind_group,
     }
+}
+
+fn image_is_valid(image: &ImageFrame) -> bool {
+    image.width > 0
+        && image.height > 0
+        && image
+            .width
+            .checked_mul(image.height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .is_some_and(|expected| expected as usize == image.rgba8.len())
 }
 
 struct TextureMip {
@@ -3595,9 +3612,9 @@ fn unit_sphere() -> (Vec<Vertex>, Vec<u16>) {
 #[cfg(test)]
 mod mesh_tests {
     use super::{
-        build_mip_chain, directional_light_view_projection, normal_matrix_cols, unit_cube,
-        unit_cylinder, unit_sphere, ImageFrame, Mat4, RenderScene, Transform3, Vec3, VisualShape,
-        SHADER, SHADOW_SHADER, SKY_SHADER,
+        build_mip_chain, directional_light_view_projection, image_is_valid, normal_matrix_cols,
+        unit_cube, unit_cylinder, unit_sphere, ImageFrame, Mat4, RenderScene, Transform3, Vec3,
+        VisualShape, SHADER, SHADOW_SHADER, SKY_SHADER,
     };
     use crate::taa::{COPY_SHADER, TAA_SHADER};
     use rne_render::RenderSceneItem;
@@ -3735,6 +3752,17 @@ mod mesh_tests {
         // 50% linear light encodes to about 188 in sRGB, rather than 128.
         assert!((186..=189).contains(&mips[1].rgba8[0]));
         assert_eq!(mips[1].rgba8, [188, 188, 188, 255]);
+    }
+
+    #[test]
+    fn malformed_base_images_are_rejected_before_texture_upload() {
+        let malformed = ImageFrame::from_rgba8(2, 2, vec![255; 15]);
+        assert!(!image_is_valid(&malformed));
+        // `upload_texture_impl` substitutes this complete RGBA fallback before
+        // creating a mip chain or issuing a texture upload.
+        let fallback = ImageFrame::from_rgba8(1, 1, vec![255, 255, 255, 255]);
+        assert!(image_is_valid(&fallback));
+        assert_eq!(build_mip_chain(&fallback, true).len(), 1);
     }
 
     #[test]
