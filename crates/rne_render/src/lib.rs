@@ -46,7 +46,7 @@ pub use gaussian_splat_validation::{
 pub use grid_mesh::{grid_mesh, GridMeshSpec};
 pub use headless::HeadlessRenderBackend;
 pub use image::{hash_rgba8, ImageFrame, RenderTarget};
-pub use material::PbrMaterial;
+pub use material::{PbrMaterial, SurfaceDetail};
 pub use mesh::{
     load_gltf_scene, load_mesh, load_mesh_parts, load_stl, load_stl_bytes, LoadedMeshPart,
     MeshLoadError, TriangleMesh,

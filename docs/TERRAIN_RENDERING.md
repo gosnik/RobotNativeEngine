@@ -85,3 +85,26 @@ upright. This is bounded regression evidence, not a guarantee for arbitrary
 loads, impact speeds or timestep sizes. Loaded small-sphere tests cover both
 heightfields and boxes; decreasing timestep should still be checked for a new
 robot or operating envelope.
+
+## World-space surface detail
+
+`PbrMaterial::with_surface_detail(SurfaceDetail)` adds an optional cached,
+world-XZ-projected color and bump layer for mostly horizontal ground. Set
+`repeats_per_metre` to control real-world texel density independently of the
+heightmap UVs. `albedo_strength`, `normal_strength` and `color_variation` control
+fine grain, subtle shading-normal variation and smooth broad mottling. This is
+shading only: mesh positions and collision remain unchanged.
+
+The original base-color map stays aligned with the heightfield unless
+`anti_tiling` is explicitly enabled. That option continuously blends rotated,
+offset samples of the base and detail maps, useful for repeated grass tiles;
+it should remain disabled for authored river/ridge color maps. Detail-enabled
+base-color and detail images use cached linear-light mip chains and filtered
+minification to reduce distant shimmer. Ordinary materials default to no detail
+and retain their existing rendering path. Texture uploads and mip generation
+occur on cache misses, not on each frame, and the layer adds no draw calls.
+
+Detail maps use mirrored repeat addressing; anti-tiling base maps do as well,
+while authored base maps retain repeat addressing. Mirroring avoids wrap-edge
+color discontinuities even for generated images whose opposite edges differ.
+Malformed detail images are omitted during material sanitization.

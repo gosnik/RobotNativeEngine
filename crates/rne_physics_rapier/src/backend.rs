@@ -89,6 +89,8 @@ struct RapierWorldState {
     collider_to_entity: HashMap<ColliderHandle, Entity>,
     /// Exact generational owner tokens; only keyed lookups affect pair filtering.
     collider_owners: HashMap<ColliderHandle, Entity>,
+    /// Per-compound-child friction overrides, keyed by Rapier's compound subshape ID.
+    compound_part_frictions: HashMap<ColliderHandle, HashMap<u32, f32>>,
     entity_to_joint: HashMap<Entity, ImpulseJointHandle>,
     entity_to_multibody_joint: HashMap<Entity, MultibodyJointHandle>,
     /// Welds on articulated links: a [`FixedJointDesc`] on an entity whose own
@@ -133,6 +135,7 @@ struct PositionMotorDiagnosticTarget {
 
 struct OwnerCollisionHooks<'a> {
     owners: &'a HashMap<ColliderHandle, Entity>,
+    compound_part_frictions: &'a HashMap<ColliderHandle, HashMap<u32, f32>>,
 }
 
 impl OwnerCollisionHooks<'_> {
@@ -173,18 +176,53 @@ impl PhysicsHooks for OwnerCollisionHooks<'_> {
     fn filter_intersection_pair(&self, context: &PairFilterContext<'_>) -> bool {
         self.allows_pair(context)
     }
+
+    fn modify_solver_contacts(&self, context: &mut ContactModificationContext<'_>) {
+        let friction1 = self
+            .compound_part_frictions
+            .get(&context.collider1)
+            .and_then(|parts| parts.get(&context.manifold.subshape1))
+            .copied();
+        let friction2 = self
+            .compound_part_frictions
+            .get(&context.collider2)
+            .and_then(|parts| parts.get(&context.manifold.subshape2))
+            .copied();
+        let combined_friction = match (friction1, friction2) {
+            (Some(friction1), Some(friction2)) => (friction1 + friction2) * 0.5,
+            (Some(friction), None) => {
+                (friction + context.colliders[context.collider2].friction()) * 0.5
+            }
+            (None, Some(friction)) => {
+                (context.colliders[context.collider1].friction() + friction) * 0.5
+            }
+            (None, None) => return,
+        };
+
+        if !combined_friction.is_finite() {
+            return;
+        }
+
+        // Compound-part friction deliberately uses the public material rule:
+        // average the selected child's material with its opposing collider.
+        for contact in &mut *context.solver_contacts {
+            contact.friction = combined_friction;
+        }
+    }
 }
 
 fn advance_rapier_pipeline(state: &mut RapierWorldState) {
     let owner_hooks = OwnerCollisionHooks {
         owners: &state.collider_owners,
+        compound_part_frictions: &state.compound_part_frictions,
     };
     // Retain the original unit hook when this world has no marked collider.
-    let hooks: &dyn PhysicsHooks = if state.collider_owners.is_empty() {
-        &()
-    } else {
-        &owner_hooks
-    };
+    let hooks: &dyn PhysicsHooks =
+        if state.collider_owners.is_empty() && state.compound_part_frictions.is_empty() {
+            &()
+        } else {
+            &owner_hooks
+        };
     state.physics_pipeline.step(
         &state.gravity,
         &state.integration_parameters,
@@ -358,6 +396,55 @@ impl RapierBackend {
             return false;
         };
         collider.set_friction(friction);
+        true
+    }
+
+    /// Overrides friction for one child of an already-created compound collider.
+    ///
+    /// The override applies only while that child contacts another collider. Its
+    /// effective solver friction is the arithmetic mean of `friction` and the
+    /// other collider's current friction. Returns false for an unknown world or
+    /// entity, a non-compound collider, an invalid part index, or a non-finite or
+    /// negative friction value.
+    pub fn set_compound_part_friction(
+        &mut self,
+        physics_world: PhysicsWorldId,
+        entity: Entity,
+        part_index: u32,
+        friction: f32,
+    ) -> bool {
+        if !friction.is_finite() || friction < 0.0 {
+            return false;
+        }
+        let Ok(state) = self.world_mut(physics_world) else {
+            return false;
+        };
+        let Some(handle) = state.entity_to_collider.get(&entity).copied() else {
+            return false;
+        };
+        let Some(collider) = state.colliders.get(handle) else {
+            return false;
+        };
+        let Some(compound) = collider.shape().as_compound() else {
+            return false;
+        };
+        if usize::try_from(part_index)
+            .ok()
+            .is_none_or(|index| index >= compound.shapes().len())
+        {
+            return false;
+        }
+
+        state
+            .compound_part_frictions
+            .entry(handle)
+            .or_default()
+            .insert(part_index, friction);
+        if let Some(collider) = state.colliders.get_mut(handle) {
+            collider
+                .set_active_hooks(collider.active_hooks() | ActiveHooks::MODIFY_SOLVER_CONTACTS);
+            collider.set_position(*collider.position());
+        }
         true
     }
 
@@ -666,6 +753,7 @@ impl PhysicsBackend for RapierBackend {
                 entity_to_collider: HashMap::new(),
                 collider_to_entity: HashMap::new(),
                 collider_owners: HashMap::new(),
+                compound_part_frictions: HashMap::new(),
                 entity_to_joint: HashMap::new(),
                 entity_to_multibody_joint: HashMap::new(),
                 entity_to_attachment: HashMap::new(),
@@ -1285,6 +1373,7 @@ fn sync_entity_collider(
             state.collider_to_entity.remove(&handle);
             state.entity_to_collider.remove(&entity);
             state.collider_owners.remove(&handle);
+            state.compound_part_frictions.remove(&handle);
             state.query_pipeline_needs_rebuild = true;
         }
         (None, None) => {}
@@ -1311,11 +1400,15 @@ fn sync_collider_owner(world: &World, state: &mut RapierWorldState, entity: Enti
         }
     }
     if let Some(collider) = state.colliders.get_mut(handle) {
-        collider.set_active_hooks(if owner.is_some() {
+        let mut active_hooks = if owner.is_some() {
             ActiveHooks::FILTER_CONTACT_PAIRS | ActiveHooks::FILTER_INTERSECTION_PAIR
         } else {
             ActiveHooks::empty()
-        });
+        };
+        if state.compound_part_frictions.contains_key(&handle) {
+            active_hooks |= ActiveHooks::MODIFY_SOLVER_CONTACTS;
+        }
+        collider.set_active_hooks(active_hooks);
         // Setting hooks alone does not invalidate cached Rapier pairs. Reapply
         // the unchanged pose to refresh even stationary/sleeping intersections.
         collider.set_position(*collider.position());
@@ -1326,6 +1419,7 @@ fn remove_stale_owned_colliders(world: &World, state: &mut RapierWorldState) {
     let mut stale: Vec<_> = state
         .collider_owners
         .keys()
+        .chain(state.compound_part_frictions.keys())
         .filter_map(|handle| {
             let entity = state.collider_to_entity.get(handle).copied()?;
             (world.get::<RigidBody>(entity).is_none() || world.get::<Collider>(entity).is_none())
@@ -1333,11 +1427,13 @@ fn remove_stale_owned_colliders(world: &World, state: &mut RapierWorldState) {
         })
         .collect();
     stale.sort_unstable_by_key(|(entity, _)| *entity);
+    stale.dedup();
     for (entity, handle) in stale {
         state
             .colliders
             .remove(handle, &mut state.island_manager, &mut state.bodies, true);
         state.collider_owners.remove(&handle);
+        state.compound_part_frictions.remove(&handle);
         state.collider_to_entity.remove(&handle);
         state.entity_to_collider.remove(&entity);
         state.query_pipeline_needs_rebuild = true;
@@ -4320,6 +4416,171 @@ mod tests {
             backend.sync_from_ecs(&mut world, id),
             Err(PhysicsError::InitializationFailed)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both contact orderings and hook updates in one fixture.
+    fn compound_part_friction_overrides_only_the_selected_child_on_either_contact_side() {
+        for compound_first in [true, false] {
+            let mut backend = RapierBackend::new();
+            let id = backend
+                .create_world(PhysicsWorldDesc {
+                    gravity_m_s2: Vec3::ZERO,
+                    ..PhysicsWorldDesc::default()
+                })
+                .unwrap();
+            let mut world = World::new();
+            let spawn_compound = |world: &mut World| {
+                world
+                    .spawn((
+                        RigidBody::default(),
+                        Collider {
+                            material: rne_physics::PhysicsMaterial {
+                                friction: 0.2,
+                                ..rne_physics::PhysicsMaterial::default()
+                            },
+                            ..Collider::default()
+                        },
+                        CompoundCollider {
+                            parts: vec![
+                                rne_physics::ColliderPart {
+                                    shape: ColliderShape::Sphere { radius_m: 0.5 },
+                                    local_offset: Transform3::from_translation_rotation(
+                                        -Vec3::X,
+                                        Quat::IDENTITY,
+                                    ),
+                                },
+                                rne_physics::ColliderPart {
+                                    shape: ColliderShape::Sphere { radius_m: 0.5 },
+                                    local_offset: Transform3::from_translation_rotation(
+                                        Vec3::X,
+                                        Quat::IDENTITY,
+                                    ),
+                                },
+                            ],
+                        },
+                        Transform3::IDENTITY,
+                    ))
+                    .id()
+            };
+            let spawn_fixed = |world: &mut World, x: f64| {
+                world
+                    .spawn((
+                        RigidBody {
+                            body_type: RigidBodyType::Fixed,
+                            ..RigidBody::default()
+                        },
+                        Collider {
+                            shape: ColliderShape::Sphere { radius_m: 0.5 },
+                            material: rne_physics::PhysicsMaterial {
+                                friction: 0.6,
+                                ..rne_physics::PhysicsMaterial::default()
+                            },
+                            ..Collider::default()
+                        },
+                        Transform3::from_translation_rotation(
+                            Vec3::new(x, 0.0, 0.0),
+                            Quat::IDENTITY,
+                        ),
+                    ))
+                    .id()
+            };
+            let (compound, toe_obstacle, shin_obstacle) = if compound_first {
+                let compound = spawn_compound(&mut world);
+                let toe = spawn_fixed(&mut world, -1.9);
+                let shin = spawn_fixed(&mut world, 1.9);
+                (compound, toe, shin)
+            } else {
+                let toe = spawn_fixed(&mut world, -1.9);
+                let shin = spawn_fixed(&mut world, 1.9);
+                let compound = spawn_compound(&mut world);
+                (compound, toe, shin)
+            };
+
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            let state = backend.world(id).unwrap();
+            let compound_handle = state.entity_to_collider[&compound];
+            let body_handle = state.entity_to_body[&compound];
+            assert!(!backend.set_compound_part_friction(id, compound, 2, 1.0));
+            assert!(!backend.set_compound_part_friction(id, compound, 0, f32::NAN));
+            assert!(!backend.set_compound_part_friction(id, compound, 0, -0.1));
+            assert!(!backend.set_compound_part_friction(
+                PhysicsWorldId(u32::MAX),
+                compound,
+                0,
+                1.0
+            ));
+            assert!(backend.set_compound_part_friction(id, compound, 0, 1.0));
+            let state = backend.world(id).unwrap();
+            assert_eq!(state.entity_to_collider[&compound], compound_handle);
+            assert_eq!(state.entity_to_body[&compound], body_handle);
+            assert_eq!(
+                state.colliders[compound_handle]
+                    .shape()
+                    .as_compound()
+                    .unwrap()
+                    .shapes()
+                    .len(),
+                2
+            );
+            let owner_a = world.spawn_empty().id();
+            let owner_b = world.spawn_empty().id();
+            world
+                .entity_mut(compound)
+                .insert(SelfCollisionExclusion { owner: owner_a });
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            assert!(backend.world(id).unwrap().colliders[compound_handle]
+                .active_hooks()
+                .contains(
+                    ActiveHooks::FILTER_CONTACT_PAIRS
+                        | ActiveHooks::FILTER_INTERSECTION_PAIR
+                        | ActiveHooks::MODIFY_SOLVER_CONTACTS
+                ));
+            world
+                .entity_mut(compound)
+                .insert(SelfCollisionExclusion { owner: owner_b });
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            assert!(backend.world(id).unwrap().colliders[compound_handle]
+                .active_hooks()
+                .contains(ActiveHooks::MODIFY_SOLVER_CONTACTS));
+            world
+                .entity_mut(compound)
+                .remove::<SelfCollisionExclusion>();
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            let active_hooks = backend.world(id).unwrap().colliders[compound_handle].active_hooks();
+            assert!(active_hooks.contains(ActiveHooks::MODIFY_SOLVER_CONTACTS));
+            assert!(!active_hooks.intersects(
+                ActiveHooks::FILTER_CONTACT_PAIRS | ActiveHooks::FILTER_INTERSECTION_PAIR
+            ));
+
+            backend.step(id, fixed_step()).unwrap();
+            let state = backend.world(id).unwrap();
+            let friction_for = |obstacle: Entity| {
+                let obstacle_handle = state.entity_to_collider[&obstacle];
+                let pair = state
+                    .narrow_phase
+                    .contact_pairs()
+                    .find(|pair| {
+                        (pair.collider1 == compound_handle && pair.collider2 == obstacle_handle)
+                            || (pair.collider2 == compound_handle
+                                && pair.collider1 == obstacle_handle)
+                    })
+                    .unwrap();
+                let manifold = pair.manifolds.first().unwrap();
+                let part_index = if pair.collider1 == compound_handle {
+                    manifold.subshape1
+                } else {
+                    manifold.subshape2
+                };
+                let friction = manifold.data.solver_contacts.first().unwrap().friction;
+                (part_index, friction)
+            };
+            let (toe_part, toe_friction) = friction_for(toe_obstacle);
+            let (shin_part, shin_friction) = friction_for(shin_obstacle);
+            assert_eq!((toe_part, shin_part), (0, 1));
+            assert_relative_eq!(toe_friction, 0.8, epsilon = 1e-6);
+            assert_relative_eq!(shin_friction, 0.4, epsilon = 1e-6);
+        }
     }
 
     #[test]

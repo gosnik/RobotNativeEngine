@@ -23,6 +23,8 @@ struct DrawUniform {
     material_params: vec4<f32>,
     emissive: vec4<f32>,
     map_params: vec4<f32>,
+    surface_detail: vec4<f32>,
+    detail_flags: vec4<f32>,
     skinning: vec4<f32>,
 }
 
@@ -40,6 +42,8 @@ struct DrawUniform {
 @group(2) @binding(9) var emissive_sampler: sampler;
 @group(2) @binding(10) var occlusion_texture: texture_2d<f32>;
 @group(2) @binding(11) var occlusion_sampler: sampler;
+@group(2) @binding(12) var detail_texture: texture_2d<f32>;
+@group(2) @binding(13) var detail_sampler: sampler;
 @group(3) @binding(0) var shadow_texture: texture_depth_2d;
 @group(3) @binding(1) var shadow_sampler: sampler_comparison;
 @group(3) @binding(2) var environment_texture: texture_2d<f32>;
@@ -291,6 +295,65 @@ fn tangent_frame(normal: vec3<f32>, world_position: vec3<f32>, uv: vec2<f32>) ->
     return mat3x3<f32>(tangent, bitangent, normal);
 }
 
+fn hash12(point: vec2<f32>) -> f32 {
+    return fract(sin(dot(point, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+// Bilinear value noise avoids a pixel-grain appearance in broad color variation.
+fn smooth_value_noise(point: vec2<f32>) -> f32 {
+    let cell = floor(point);
+    let fraction = fract(point);
+    let eased = fraction * fraction * (3.0 - 2.0 * fraction);
+    return mix(
+        mix(hash12(cell), hash12(cell + vec2<f32>(1.0, 0.0)), eased.x),
+        mix(hash12(cell + vec2<f32>(0.0, 1.0)), hash12(cell + vec2<f32>(1.0, 1.0)), eased.x),
+        eased.y,
+    );
+}
+
+fn rotated_detail_uv(world_xz: vec2<f32>, scale: f32, angle: f32, offset: vec2<f32>) -> vec2<f32> {
+    let sine = sin(angle);
+    let cosine = cos(angle);
+    let rotated = mat2x2<f32>(cosine, -sine, sine, cosine) * world_xz;
+    return rotated * scale + offset;
+}
+
+fn anti_tiled_base_color(uv: vec2<f32>, world_xz: vec2<f32>) -> vec4<f32> {
+    let primary = textureSample(base_color_texture, base_color_sampler, uv);
+    let secondary = textureSample(
+        base_color_texture,
+        base_color_sampler,
+        rotated_detail_uv(uv, 1.071, 0.61, vec2<f32>(0.31, -0.17)),
+    );
+    let tertiary = textureSample(
+        base_color_texture,
+        base_color_sampler,
+        rotated_detail_uv(uv, 0.934, -0.94, vec2<f32>(-0.23, 0.41)),
+    );
+    let blend = smooth_value_noise(world_xz * 0.19 + vec2<f32>(9.2, 15.6));
+    return mix(mix(primary, secondary, 0.38), tertiary, 0.16 + blend * 0.24);
+}
+
+fn detail_color(world_xz: vec2<f32>, repeats: f32, anti_tiling: bool) -> vec3<f32> {
+    let primary = textureSample(detail_texture, detail_sampler, world_xz * repeats).rgb;
+    if (!anti_tiling) {
+        return primary;
+    }
+    // Incommensurate scales and a smooth world-space weight break visible tile seams.
+    let secondary = textureSample(
+        detail_texture,
+        detail_sampler,
+        rotated_detail_uv(world_xz, repeats * 1.173, 0.73, vec2<f32>(19.7, 7.3)),
+    ).rgb;
+    let tertiary = textureSample(
+        detail_texture,
+        detail_sampler,
+        rotated_detail_uv(world_xz, repeats * 0.847, -1.21, vec2<f32>(-11.2, 23.9)),
+    ).rgb;
+    let blend = smooth_value_noise(world_xz * 0.23 + vec2<f32>(4.1, 8.7));
+    return mix(mix(primary, secondary, 0.42), tertiary, 0.18 + blend * 0.22);
+}
+
 fn shade_fragment(input: VertexOutput) -> vec4<f32> {
     let light_dir = normalize(camera.light_ambient.xyz);
     let geometric_normal = normalize(input.world_normal);
@@ -298,7 +361,7 @@ fn shade_fragment(input: VertexOutput) -> vec4<f32> {
     let visibility = shadow_visibility(input, geometric_ndotl);
     let shadowed = mix(1.0 - camera.diffuse_shadow.y, 1.0, visibility);
     let uv = vec2<f32>(input.texcoord.x, 1.0 - input.texcoord.y);
-    let texture_color = textureSample(
+    var texture_color = textureSample(
         base_color_texture,
         base_color_sampler,
         uv,
@@ -311,8 +374,45 @@ fn shade_fragment(input: VertexOutput) -> vec4<f32> {
     let normal = normalize(
         tangent_frame(geometric_normal, input.world_position, uv) * tangent_normal,
     );
-    let mapped_ndotl = max(dot(normal, light_dir), 0.0);
-    let albedo = input.color.rgb * draw.base_color.rgb * texture_color.rgb;
+    var shading_normal = normal;
+    var detail_albedo = vec3<f32>(1.0);
+    if (draw.detail_flags.x > 0.5) {
+        let repeats = draw.surface_detail.x;
+        let detail_uv = input.world_position.xz * repeats;
+        let detail_rgb = detail_color(
+            input.world_position.xz,
+            repeats,
+            draw.detail_flags.y > 0.5,
+        );
+        if (draw.detail_flags.y > 0.5) {
+            // This intentionally de-aligns mesh-UV macro color. Enable it only
+            // for broad, flat surfaces where repetition is more apparent.
+            texture_color = anti_tiled_base_color(uv, input.world_position.xz);
+        }
+        let luminance = dot(detail_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        // Keep the authored macro texture dominant while allowing fine grain to
+        // remain visible at practical strengths.
+        detail_albedo *= mix(1.0, clamp(0.4 + luminance * 1.2, 0.4, 1.6), draw.surface_detail.y);
+        let broad_variation = smooth_value_noise(input.world_position.xz * 0.12 + vec2<f32>(17.3, 2.9));
+        detail_albedo *= 1.0 + (broad_variation - 0.5) * draw.surface_detail.w * 0.5;
+
+        let dimensions = vec2<f32>(textureDimensions(detail_texture));
+        let texel = 1.0 / max(dimensions, vec2<f32>(1.0));
+        let left = dot(textureSample(detail_texture, detail_sampler, detail_uv - vec2<f32>(texel.x, 0.0)).rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let right = dot(textureSample(detail_texture, detail_sampler, detail_uv + vec2<f32>(texel.x, 0.0)).rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let down = dot(textureSample(detail_texture, detail_sampler, detail_uv - vec2<f32>(0.0, texel.y)).rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let up = dot(textureSample(detail_texture, detail_sampler, detail_uv + vec2<f32>(0.0, texel.y)).rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        var detail_reference = vec3<f32>(0.0, 0.0, 1.0);
+        if (abs(dot(detail_reference, normal)) > 0.9) {
+            detail_reference = vec3<f32>(1.0, 0.0, 0.0);
+        }
+        let tangent = normalize(cross(detail_reference, normal));
+        let bitangent = normalize(cross(normal, tangent));
+        let bump = (tangent * (left - right) + bitangent * (down - up)) * draw.surface_detail.z * 0.18;
+        shading_normal = normalize(normal + bump);
+    }
+    let mapped_ndotl = max(dot(shading_normal, light_dir), 0.0);
+    let albedo = input.color.rgb * draw.base_color.rgb * texture_color.rgb * detail_albedo;
     let roughness_sample = textureSample(roughness_texture, roughness_sampler, uv).r;
     let metallic_roughness_sample = textureSample(
         metallic_roughness_texture,
@@ -332,8 +432,8 @@ fn shade_fragment(input: VertexOutput) -> vec4<f32> {
     );
     let view_dir = normalize(camera.camera_position.xyz - input.world_position);
     let half_dir = normalize(view_dir + light_dir);
-    let ndotv = max(dot(normal, view_dir), 0.0);
-    let ndoth = max(dot(normal, half_dir), 0.0);
+    let ndotv = max(dot(shading_normal, view_dir), 0.0);
+    let ndoth = max(dot(shading_normal, half_dir), 0.0);
     let vdoth = max(dot(view_dir, half_dir), 0.0);
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
     let fresnel = fresnel_schlick(vdoth, f0);
@@ -354,9 +454,9 @@ fn shade_fragment(input: VertexOutput) -> vec4<f32> {
     let emissive = draw.emissive.rgb *
         mix(vec3<f32>(1.0), emissive_sample, draw.map_params.w);
     let environment_factor = camera.environment.w;
-    let environment_diffuse = sample_diffuse_environment(normal) *
+    let environment_diffuse = sample_diffuse_environment(shading_normal) *
         camera.environment.x * environment_factor * albedo * (1.0 - metallic) * occlusion;
-    let environment_reflection = reflect(-view_dir, normal);
+    let environment_reflection = reflect(-view_dir, shading_normal);
     let environment_fresnel = fresnel_schlick(ndotv, f0);
     let environment_specular = sample_prefiltered_environment(environment_reflection, roughness * 4.0) *
         camera.environment.y * environment_factor * environment_fresnel * occlusion;
@@ -531,6 +631,8 @@ struct DrawUniform {
     material_params: vec4<f32>,
     emissive: vec4<f32>,
     map_params: vec4<f32>,
+    surface_detail: vec4<f32>,
+    detail_flags: vec4<f32>,
     skinning: vec4<f32>,
 }
 
@@ -668,6 +770,8 @@ struct DrawUniform {
     material_params: [f32; 4],
     emissive: [f32; 4],
     map_params: [f32; 4],
+    surface_detail: [f32; 4],
+    detail_flags: [f32; 4],
     skinning: [f32; 4],
 }
 
@@ -705,7 +809,8 @@ pub struct PrimitiveRenderer {
     mesh_cache: HashMap<usize, GpuMesh>,
     texture_layout: wgpu::BindGroupLayout,
     fallback_texture: GpuTexture,
-    texture_cache: HashMap<usize, GpuTexture>,
+    // The same source can be used with different detail addressing/mip modes.
+    texture_cache: HashMap<(usize, bool, bool), GpuTexture>,
     fallback_normal_texture: GpuTexture,
     normal_texture_cache: HashMap<usize, GpuTexture>,
     fallback_roughness_texture: GpuTexture,
@@ -716,6 +821,8 @@ pub struct PrimitiveRenderer {
     emissive_texture_cache: HashMap<usize, GpuTexture>,
     fallback_occlusion_texture: GpuTexture,
     occlusion_texture_cache: HashMap<usize, GpuTexture>,
+    fallback_detail_texture: GpuTexture,
+    detail_texture_cache: HashMap<usize, GpuTexture>,
     fallback_environment: GpuEnvironmentTexture,
     environment_texture_cache: HashMap<usize, GpuEnvironmentTexture>,
     /// The sources of every cached upload. The caches are keyed by `Arc`
@@ -963,6 +1070,8 @@ impl PrimitiveRenderer {
                 (9, false),
                 (10, true),
                 (11, false),
+                (12, true),
+                (13, false),
             ]
             .map(|(binding, is_texture)| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -1412,6 +1521,15 @@ impl PrimitiveRenderer {
             &ImageFrame::from_rgba8(1, 1, vec![255, 255, 255, 255]),
             wgpu::TextureFormat::Rgba8Unorm,
         );
+        let fallback_detail_texture = upload_texture_with_mips(
+            device,
+            queue,
+            &texture_layout,
+            "rne_flat_detail_texture",
+            &ImageFrame::from_rgba8(1, 1, vec![128, 128, 128, 255]),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            true,
+        );
         let fallback_environment = upload_environment_texture(
             device,
             queue,
@@ -1493,6 +1611,8 @@ impl PrimitiveRenderer {
             emissive_texture_cache: HashMap::new(),
             fallback_occlusion_texture,
             occlusion_texture_cache: HashMap::new(),
+            fallback_detail_texture,
+            detail_texture_cache: HashMap::new(),
             fallback_environment,
             environment_texture_cache: HashMap::new(),
             cache_sources: Vec::new(),
@@ -1618,6 +1738,17 @@ impl PrimitiveRenderer {
                     f32::from(material.occlusion_texture.is_some()),
                     f32::from(material.emissive_texture.is_some()),
                 ],
+                surface_detail: material.surface_detail.as_ref().map_or([0.0; 4], |detail| {
+                    [
+                        detail.repeats_per_metre,
+                        detail.albedo_strength,
+                        detail.normal_strength,
+                        detail.color_variation,
+                    ]
+                }),
+                detail_flags: material.surface_detail.as_ref().map_or([0.0; 4], |detail| {
+                    [1.0, f32::from(detail.anti_tiling), 0.0, 0.0]
+                }),
                 skinning: [
                     f32::from(
                         item.mesh
@@ -1658,16 +1789,40 @@ impl PrimitiveRenderer {
                 let _ = self.gpu_mesh(device, mesh);
             }
             if let Some(texture) = &item.base_color_texture {
-                let key = Arc::as_ptr(texture) as usize;
+                let detail = item
+                    .material
+                    .surface_detail
+                    .as_ref()
+                    .filter(|detail| detail.has_valid_image());
+                let use_mips = detail.is_some();
+                let mirror_repeat = item
+                    .material
+                    .surface_detail
+                    .as_ref()
+                    .filter(|detail| detail.has_valid_image())
+                    .is_some_and(|detail| detail.anti_tiling);
+                let key = (Arc::as_ptr(texture) as usize, use_mips, mirror_repeat);
                 if !self.texture_cache.contains_key(&key) {
-                    let uploaded = upload_texture(
-                        device,
-                        queue,
-                        &self.texture_layout,
-                        "rne_base_color_texture",
-                        texture,
-                        wgpu::TextureFormat::Rgba8UnormSrgb,
-                    );
+                    let uploaded = if use_mips {
+                        upload_texture_with_mips(
+                            device,
+                            queue,
+                            &self.texture_layout,
+                            "rne_base_color_texture_mipped",
+                            texture,
+                            wgpu::TextureFormat::Rgba8UnormSrgb,
+                            mirror_repeat,
+                        )
+                    } else {
+                        upload_texture(
+                            device,
+                            queue,
+                            &self.texture_layout,
+                            "rne_base_color_texture",
+                            texture,
+                            wgpu::TextureFormat::Rgba8UnormSrgb,
+                        )
+                    };
                     self.texture_cache.insert(key, uploaded);
                     self.cache_sources.push(Arc::clone(texture) as _);
                 }
@@ -1745,6 +1900,27 @@ impl PrimitiveRenderer {
                     );
                     self.occlusion_texture_cache.insert(key, uploaded);
                     self.cache_sources.push(Arc::clone(texture) as _);
+                }
+            }
+            if let Some(detail) = item
+                .material
+                .surface_detail
+                .as_ref()
+                .filter(|detail| detail.has_valid_image())
+            {
+                let key = Arc::as_ptr(&detail.image) as usize;
+                if !self.detail_texture_cache.contains_key(&key) {
+                    let uploaded = upload_texture_with_mips(
+                        device,
+                        queue,
+                        &self.texture_layout,
+                        "rne_surface_detail_texture",
+                        &detail.image,
+                        wgpu::TextureFormat::Rgba8UnormSrgb,
+                        true,
+                    );
+                    self.detail_texture_cache.insert(key, uploaded);
+                    self.cache_sources.push(Arc::clone(&detail.image) as _);
                 }
             }
         }
@@ -1924,7 +2100,20 @@ impl PrimitiveRenderer {
                 let texture = item
                     .base_color_texture
                     .as_ref()
-                    .and_then(|texture| self.texture_cache.get(&(Arc::as_ptr(texture) as usize)))
+                    .and_then(|texture| {
+                        self.texture_cache.get(&(
+                            Arc::as_ptr(texture) as usize,
+                            item.material
+                                .surface_detail
+                                .as_ref()
+                                .is_some_and(|detail| detail.has_valid_image()),
+                            item.material
+                                .surface_detail
+                                .as_ref()
+                                .filter(|detail| detail.has_valid_image())
+                                .is_some_and(|detail| detail.anti_tiling),
+                        ))
+                    })
                     .unwrap_or(&self.fallback_texture);
                 let normal_texture = item
                     .material
@@ -1971,6 +2160,15 @@ impl PrimitiveRenderer {
                             .get(&(Arc::as_ptr(texture) as usize))
                     })
                     .unwrap_or(&self.fallback_occlusion_texture);
+                let detail_texture = item
+                    .material
+                    .surface_detail
+                    .as_ref()
+                    .and_then(|detail| {
+                        self.detail_texture_cache
+                            .get(&(Arc::as_ptr(&detail.image) as usize))
+                    })
+                    .unwrap_or(&self.fallback_detail_texture);
 
                 let skin = if let Some(gpu_mesh) = &dynamic_meshes[index] {
                     gpu_mesh.skin.as_ref().unwrap_or(&self.fallback_skin)
@@ -1994,6 +2192,7 @@ impl PrimitiveRenderer {
                         metallic_roughness_texture,
                         emissive_texture,
                         occlusion_texture,
+                        detail_texture,
                     ],
                 );
                 let scene_bind_group = create_scene_bind_group(
@@ -2523,9 +2722,9 @@ fn upload_skinning(
 fn create_material_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    textures: [&GpuTexture; 6],
+    textures: [&GpuTexture; 7],
 ) -> wgpu::BindGroup {
-    let [base_color_texture, normal_texture, roughness_texture, metallic_roughness_texture, emissive_texture, occlusion_texture] =
+    let [base_color_texture, normal_texture, roughness_texture, metallic_roughness_texture, emissive_texture, occlusion_texture, detail_texture] =
         textures;
     let entries = [
         (0, &base_color_texture.view, &base_color_texture.sampler),
@@ -2538,6 +2737,7 @@ fn create_material_bind_group(
         ),
         (8, &emissive_texture.view, &emissive_texture.sampler),
         (10, &occlusion_texture.view, &occlusion_texture.sampler),
+        (12, &detail_texture.view, &detail_texture.sampler),
     ];
     let mut bind_group_entries = Vec::with_capacity(entries.len() * 2);
     for (binding, view, sampler) in entries {
@@ -2605,6 +2805,62 @@ fn upload_texture(
     image: &ImageFrame,
     format: wgpu::TextureFormat,
 ) -> GpuTexture {
+    upload_texture_impl(
+        device,
+        queue,
+        layout,
+        label,
+        image,
+        format,
+        TextureUploadOptions::default(),
+    )
+}
+
+/// Detail maps receive a CPU-generated mip chain once at upload. This avoids
+/// high-frequency ground texture shimmer without adding per-frame work. Their
+/// mirrored repeat sampler also avoids a hard seam when source tile edges differ.
+fn upload_texture_with_mips(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    label: &str,
+    image: &ImageFrame,
+    format: wgpu::TextureFormat,
+    mirror_repeat: bool,
+) -> GpuTexture {
+    upload_texture_impl(
+        device,
+        queue,
+        layout,
+        label,
+        image,
+        format,
+        TextureUploadOptions {
+            generate_mips: true,
+            mirror_repeat,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct TextureUploadOptions {
+    generate_mips: bool,
+    mirror_repeat: bool,
+}
+
+fn upload_texture_impl(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    label: &str,
+    image: &ImageFrame,
+    format: wgpu::TextureFormat,
+    options: TextureUploadOptions,
+) -> GpuTexture {
+    let mip_chain = options
+        .generate_mips
+        .then(|| build_mip_chain(image, format == wgpu::TextureFormat::Rgba8UnormSrgb));
+    let mip_level_count = mip_chain.as_ref().map_or(1, Vec::len) as u32;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -2612,39 +2868,76 @@ fn upload_texture(
             height: image.height.max(1),
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &image.rgba8,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(image.width * 4),
-            rows_per_image: Some(image.height),
-        },
-        wgpu::Extent3d {
-            width: image.width,
-            height: image.height,
-            depth_or_array_layers: 1,
-        },
-    );
+    if let Some(mips) = mip_chain {
+        for (level, mip) in mips.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &mip.rgba8,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(mip.width * 4),
+                    rows_per_image: Some(mip.height),
+                },
+                wgpu::Extent3d {
+                    width: mip.width,
+                    height: mip.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    } else {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.rgba8,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * 4),
+                rows_per_image: Some(image.height),
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some(label),
-        address_mode_u: wgpu::AddressMode::Repeat,
-        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_u: if options.mirror_repeat {
+            wgpu::AddressMode::MirrorRepeat
+        } else {
+            wgpu::AddressMode::Repeat
+        },
+        address_mode_v: if options.mirror_repeat {
+            wgpu::AddressMode::MirrorRepeat
+        } else {
+            wgpu::AddressMode::Repeat
+        },
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: if options.generate_mips {
+            wgpu::FilterMode::Linear
+        } else {
+            wgpu::FilterMode::Nearest
+        },
         ..Default::default()
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2666,6 +2959,77 @@ fn upload_texture(
         view,
         sampler,
         _bind_group: bind_group,
+    }
+}
+
+struct TextureMip {
+    width: u32,
+    height: u32,
+    rgba8: Vec<u8>,
+}
+
+fn build_mip_chain(image: &ImageFrame, srgb: bool) -> Vec<TextureMip> {
+    let mut chain = vec![TextureMip {
+        width: image.width,
+        height: image.height,
+        rgba8: image.rgba8.clone(),
+    }];
+    while chain
+        .last()
+        .is_some_and(|mip| mip.width > 1 || mip.height > 1)
+    {
+        let source = chain.last().expect("mip chain has base level");
+        let width = (source.width / 2).max(1);
+        let height = (source.height / 2).max(1);
+        let mut rgba8 = vec![0; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let mut accum = [0.0; 4];
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let sx = (x * 2 + dx).min(source.width - 1);
+                        let sy = (y * 2 + dy).min(source.height - 1);
+                        let offset = ((sy * source.width + sx) * 4) as usize;
+                        for (channel, accumulated) in accum.iter_mut().take(3).enumerate() {
+                            let value = f32::from(source.rgba8[offset + channel]) / 255.0;
+                            *accumulated += if srgb { srgb_to_linear(value) } else { value };
+                        }
+                        accum[3] += f32::from(source.rgba8[offset + 3]) / 255.0;
+                    }
+                }
+                let offset = ((y * width + x) * 4) as usize;
+                for (channel, accumulated) in accum.iter().take(3).enumerate() {
+                    let value = accumulated * 0.25;
+                    rgba8[offset + channel] = (if srgb { linear_to_srgb(value) } else { value }
+                        * 255.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+                rgba8[offset + 3] = (accum[3] * 63.75).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        chain.push(TextureMip {
+            width,
+            height,
+            rgba8,
+        });
+    }
+    chain
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> f32 {
+    if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
     }
 }
 
@@ -3015,10 +3379,36 @@ fn scene_temporal_key(scene: &RenderScene) -> u64 {
         for value in item.color_rgba {
             mix(u64::from(value.to_bits()));
         }
+        for value in item.material.base_color_rgba {
+            mix(u64::from(value.to_bits()));
+        }
         mix(u64::from(item.material.roughness.to_bits()));
         mix(u64::from(item.material.metallic.to_bits()));
+        mix(u64::from(item.material.normal_strength.to_bits()));
+        mix(u64::from(item.material.occlusion_strength.to_bits()));
         for value in item.material.emissive_rgb {
             mix(u64::from(value.to_bits()));
+        }
+        for texture in [
+            item.base_color_texture.as_ref(),
+            item.material.normal_texture.as_ref(),
+            item.material.roughness_texture.as_ref(),
+            item.material.metallic_roughness_texture.as_ref(),
+            item.material.emissive_texture.as_ref(),
+            item.material.occlusion_texture.as_ref(),
+        ] {
+            mix(texture.map_or(0, |image| Arc::as_ptr(image) as usize as u64));
+        }
+        if let Some(detail) = &item.material.surface_detail {
+            mix(1);
+            mix(Arc::as_ptr(&detail.image) as usize as u64);
+            mix(u64::from(detail.repeats_per_metre.to_bits()));
+            mix(u64::from(detail.albedo_strength.to_bits()));
+            mix(u64::from(detail.normal_strength.to_bits()));
+            mix(u64::from(detail.color_variation.to_bits()));
+            mix(u64::from(detail.anti_tiling));
+        } else {
+            mix(0);
         }
     }
     hash
@@ -3205,9 +3595,9 @@ fn unit_sphere() -> (Vec<Vertex>, Vec<u16>) {
 #[cfg(test)]
 mod mesh_tests {
     use super::{
-        directional_light_view_projection, normal_matrix_cols, unit_cube, unit_cylinder,
-        unit_sphere, Mat4, RenderScene, Transform3, Vec3, VisualShape, SHADER, SHADOW_SHADER,
-        SKY_SHADER,
+        build_mip_chain, directional_light_view_projection, normal_matrix_cols, unit_cube,
+        unit_cylinder, unit_sphere, ImageFrame, Mat4, RenderScene, Transform3, Vec3, VisualShape,
+        SHADER, SHADOW_SHADER, SKY_SHADER,
     };
     use crate::taa::{COPY_SHADER, TAA_SHADER};
     use rne_render::RenderSceneItem;
@@ -3328,6 +3718,23 @@ mod mesh_tests {
                 .validate(&module)
                 .unwrap_or_else(|error| panic!("{label} WGSL validation failed: {error}"));
         }
+    }
+
+    #[test]
+    fn srgb_detail_mips_average_in_linear_light() {
+        let image = ImageFrame::from_rgba8(
+            2,
+            2,
+            vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ],
+        );
+        let mips = build_mip_chain(&image, true);
+        assert_eq!(mips.len(), 2);
+        assert_eq!((mips[1].width, mips[1].height), (1, 1));
+        // 50% linear light encodes to about 188 in sRGB, rather than 128.
+        assert!((186..=189).contains(&mips[1].rgba8[0]));
+        assert_eq!(mips[1].rgba8, [188, 188, 188, 255]);
     }
 
     #[test]
