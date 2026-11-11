@@ -20,6 +20,8 @@ pub struct ContactPointInfos<N: SimdRealCopy> {
     pub local_p2: Point<N>,
     pub dist: N,
     pub normal_rhs_wo_bias: N,
+    /// RNE patch: normal force bound (see `SolverContact::max_normal_force`).
+    pub max_normal_force: N,
 }
 
 impl<N: SimdRealCopy> Default for ContactPointInfos<N> {
@@ -30,6 +32,7 @@ impl<N: SimdRealCopy> Default for ContactPointInfos<N> {
             local_p2: Point::origin(),
             dist: N::zero(),
             normal_rhs_wo_bias: N::zero(),
+            max_normal_force: N::splat(Real::MAX),
         }
     }
 }
@@ -153,6 +156,7 @@ impl OneBodyConstraintBuilder {
                         rhs_wo_bias: na::zero(),
                         impulse: manifold_point.warmstart_impulse,
                         impulse_accumulator: na::zero(),
+                        max_impulse: na::zero(), // RNE patch: set by `update`.
                         r: projected_mass,
                         r_mat_elts: [0.0; 2],
                     };
@@ -205,6 +209,7 @@ impl OneBodyConstraintBuilder {
                         tangent_vel: flipped_multiplier * manifold_point.tangent_velocity,
                         dist: manifold_point.dist,
                         normal_rhs_wo_bias,
+                        max_normal_force: manifold_point.max_normal_force,
                     };
 
                     builder.infos[k] = infos;
@@ -308,7 +313,10 @@ impl OneBodyConstraintBuilder {
                 element.normal_part.rhs_wo_bias = rhs_wo_bias;
                 element.normal_part.rhs = new_rhs;
                 element.normal_part.impulse_accumulator += element.normal_part.impulse;
-                element.normal_part.impulse *= params.warmstart_coefficient;
+                element.normal_part.max_impulse = info.max_normal_force * params.dt;
+                element.normal_part.impulse = (element.normal_part.impulse
+                    * params.warmstart_coefficient)
+                    .min(element.normal_part.max_impulse);
             }
 
             // Tangent part.

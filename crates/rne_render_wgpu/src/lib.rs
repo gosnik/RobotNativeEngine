@@ -19,4 +19,4 @@ pub use background::BackgroundRenderPass;
 pub use camera::CameraOrbit;
 pub use taa::TaaSettings;
 #[cfg(feature = "viewer")]
-pub use viewer::{InteractiveViewer, ViewerError};
+pub use viewer::{InteractiveViewer, ViewerError, ViewerScreenshot};

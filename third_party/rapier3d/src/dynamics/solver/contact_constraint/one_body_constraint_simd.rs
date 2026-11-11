@@ -126,6 +126,8 @@ impl SimdOneBodyConstraintBuilder {
                     .warmstart_tangent_impulse]);
 
                 let dist = SimdReal::from(gather![|ii| manifold_points[ii][k].dist]);
+                let max_normal_force =
+                    SimdReal::from(gather![|ii| manifold_points[ii][k].max_normal_force]);
                 let point = Point::from(gather![|ii| manifold_points[ii][k].point]);
 
                 let tangent_velocity =
@@ -161,6 +163,7 @@ impl SimdOneBodyConstraintBuilder {
                         rhs_wo_bias: na::zero(),
                         impulse: warmstart_impulse,
                         impulse_accumulator: na::zero(),
+                        max_impulse: na::zero(), // RNE patch: set by `update`.
                         r: projected_mass,
                         r_mat_elts: [SimdReal::zero(); 2],
                     };
@@ -202,6 +205,7 @@ impl SimdOneBodyConstraintBuilder {
                         tangent_vel: tangent_velocity * flipped_sign,
                         dist,
                         normal_rhs_wo_bias,
+                        max_normal_force,
                     };
 
                     builder.infos[k] = infos;
@@ -267,6 +271,7 @@ impl SimdOneBodyConstraintBuilder {
         let erp_inv_dt = SimdReal::splat(params.contact_erp_inv_dt());
         let max_corrective_velocity = SimdReal::splat(params.max_corrective_velocity());
         let warmstart_coeff = SimdReal::splat(params.warmstart_coefficient);
+        let solver_dt = SimdReal::splat(params.dt);
 
         let rb2 = gather![|ii| &bodies[constraint.solver_vel2[ii]]];
         let poss2 = Isometry::from(gather![|ii| rb2[ii].position]);
@@ -308,7 +313,9 @@ impl SimdOneBodyConstraintBuilder {
                 element.normal_part.rhs_wo_bias = rhs_wo_bias;
                 element.normal_part.rhs = new_rhs;
                 element.normal_part.impulse_accumulator += element.normal_part.impulse;
-                element.normal_part.impulse *= warmstart_coeff;
+                element.normal_part.max_impulse = info.max_normal_force * solver_dt;
+                element.normal_part.impulse = (element.normal_part.impulse * warmstart_coeff)
+                    .simd_min(element.normal_part.max_impulse);
             }
 
             // tangent parts.

@@ -3,6 +3,66 @@
 use crate::image::ImageFrame;
 use std::sync::Arc;
 
+/// Optional world-projected micro-detail for broad, mostly horizontal surfaces.
+///
+/// The renderer samples `image` in world XZ coordinates.  It is a visual-only
+/// layer: it never changes mesh geometry, collision, or material physics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceDetail {
+    /// Repeatable RGB detail image. Its luminance supplies color and bump detail.
+    pub image: Arc<ImageFrame>,
+    /// Image repeats in each world-space metre.
+    pub repeats_per_metre: f32,
+    /// Blend strength of image luminance into the existing albedo.
+    pub albedo_strength: f32,
+    /// Strength of the subtle world-space bump derived from image luminance.
+    pub normal_strength: f32,
+    /// Strength of broad, continuous seeded color variation.
+    pub color_variation: f32,
+    /// Crossfade rotated image and base-color samples to reduce visible
+    /// repetition on flat terrain. This intentionally breaks mesh-UV alignment,
+    /// so use it only where that alignment is not authored detail.
+    pub anti_tiling: bool,
+}
+
+impl SurfaceDetail {
+    /// Creates a conservatively tuned surface-detail layer.
+    pub fn new(image: Arc<ImageFrame>) -> Self {
+        Self {
+            image,
+            repeats_per_metre: 1.0,
+            albedo_strength: 0.35,
+            normal_strength: 0.35,
+            color_variation: 0.2,
+            anti_tiling: false,
+        }
+    }
+
+    /// Returns parameters safe for GPU upload while retaining the source image.
+    pub fn sanitized(&self) -> Self {
+        Self {
+            image: Arc::clone(&self.image),
+            repeats_per_metre: finite_or(self.repeats_per_metre, 1.0).clamp(0.01, 256.0),
+            albedo_strength: finite_or(self.albedo_strength, 0.35).clamp(0.0, 1.0),
+            normal_strength: finite_or(self.normal_strength, 0.35).clamp(0.0, 1.0),
+            color_variation: finite_or(self.color_variation, 0.2).clamp(0.0, 1.0),
+            anti_tiling: self.anti_tiling,
+        }
+    }
+
+    /// Returns whether the image can be uploaded as a complete RGBA8 texture.
+    pub fn has_valid_image(&self) -> bool {
+        self.image.width > 0
+            && self.image.height > 0
+            && self
+                .image
+                .width
+                .checked_mul(self.image.height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .is_some_and(|expected| expected as usize == self.image.rgba8.len())
+    }
+}
+
 /// Material parameters shared by render backends.
 ///
 /// The values describe a metallic-roughness workflow. `base_color_rgba` is
@@ -35,6 +95,8 @@ pub struct PbrMaterial {
     /// Strength applied to the occlusion texture in the inclusive `[0, 1]`
     /// range.
     pub occlusion_strength: f32,
+    /// Optional world-projected visual micro-detail layer.
+    pub surface_detail: Option<SurfaceDetail>,
 }
 
 impl Default for PbrMaterial {
@@ -51,6 +113,7 @@ impl Default for PbrMaterial {
             emissive_texture: None,
             occlusion_texture: None,
             occlusion_strength: 1.0,
+            surface_detail: None,
         }
     }
 }
@@ -75,6 +138,7 @@ impl PbrMaterial {
             emissive_texture: None,
             occlusion_texture: None,
             occlusion_strength: 1.0,
+            surface_detail: None,
         }
     }
 
@@ -110,6 +174,12 @@ impl PbrMaterial {
         self
     }
 
+    /// Adds a world-projected visual detail layer.
+    pub fn with_surface_detail(mut self, surface_detail: SurfaceDetail) -> Self {
+        self.surface_detail = Some(surface_detail);
+        self
+    }
+
     /// Returns finite, shader-safe material parameters.
     pub fn sanitized(&self) -> Self {
         Self {
@@ -128,6 +198,11 @@ impl PbrMaterial {
             emissive_texture: self.emissive_texture.clone(),
             occlusion_texture: self.occlusion_texture.clone(),
             occlusion_strength: finite_or(self.occlusion_strength, 1.0).clamp(0.0, 1.0),
+            surface_detail: self
+                .surface_detail
+                .as_ref()
+                .filter(|detail| detail.has_valid_image())
+                .map(SurfaceDetail::sanitized),
         }
     }
 }
@@ -158,6 +233,7 @@ mod tests {
         assert!(material.emissive_texture.is_none());
         assert!(material.occlusion_texture.is_none());
         assert_eq!(material.occlusion_strength, 1.0);
+        assert!(material.surface_detail.is_none());
     }
 
     #[test]
@@ -180,6 +256,7 @@ mod tests {
         assert!(material.emissive_texture.is_none());
         assert!(material.occlusion_texture.is_none());
         assert_eq!(material.occlusion_strength, 1.0);
+        assert!(material.surface_detail.is_none());
     }
 
     #[test]
@@ -207,5 +284,42 @@ mod tests {
         assert_eq!(sanitized.emissive_texture, Some(emissive));
         assert_eq!(sanitized.occlusion_texture, Some(occlusion));
         assert_eq!(sanitized.occlusion_strength, 0.65);
+    }
+
+    #[test]
+    fn surface_detail_is_preserved_and_sanitized() {
+        let image = Arc::new(ImageFrame::from_rgba8(1, 1, vec![96, 128, 64, 255]));
+        let material = PbrMaterial::default().with_surface_detail(SurfaceDetail {
+            image: Arc::clone(&image),
+            repeats_per_metre: f32::INFINITY,
+            albedo_strength: -1.0,
+            normal_strength: 4.0,
+            color_variation: f32::NAN,
+            anti_tiling: true,
+        });
+        let detail = material
+            .sanitized()
+            .surface_detail
+            .expect("detail retained");
+        assert_eq!(detail.image, image);
+        assert_eq!(detail.repeats_per_metre, 1.0);
+        assert_eq!(detail.albedo_strength, 0.0);
+        assert_eq!(detail.normal_strength, 1.0);
+        assert_eq!(detail.color_variation, 0.2);
+        assert!(detail.anti_tiling);
+    }
+
+    #[test]
+    fn malformed_surface_detail_images_are_dropped() {
+        for image in [
+            ImageFrame::from_rgba8(0, 1, vec![]),
+            ImageFrame::from_rgba8(2, 2, vec![0; 15]),
+            ImageFrame::from_rgba8(u32::MAX, u32::MAX, vec![]),
+        ] {
+            let material = PbrMaterial::default()
+                .with_surface_detail(SurfaceDetail::new(Arc::new(image)))
+                .sanitized();
+            assert!(material.surface_detail.is_none());
+        }
     }
 }

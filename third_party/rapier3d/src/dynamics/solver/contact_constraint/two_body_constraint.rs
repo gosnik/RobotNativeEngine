@@ -244,6 +244,7 @@ impl TwoBodyConstraintBuilder {
                         rhs_wo_bias: na::zero(),
                         impulse: manifold_point.warmstart_impulse,
                         impulse_accumulator: na::zero(),
+                        max_impulse: na::zero(), // RNE patch: set by `update`.
                         r: projected_mass,
                         r_mat_elts: [0.0; 2],
                     };
@@ -301,6 +302,7 @@ impl TwoBodyConstraintBuilder {
                     tangent_vel: manifold_point.tangent_velocity,
                     dist: manifold_point.dist,
                     normal_rhs_wo_bias,
+                    max_normal_force: manifold_point.max_normal_force,
                 };
 
                 builder.infos[k] = infos;
@@ -404,7 +406,10 @@ impl TwoBodyConstraintBuilder {
                 element.normal_part.rhs_wo_bias = rhs_wo_bias;
                 element.normal_part.rhs = new_rhs;
                 element.normal_part.impulse_accumulator += element.normal_part.impulse;
-                element.normal_part.impulse *= params.warmstart_coefficient;
+                element.normal_part.max_impulse = info.max_normal_force * params.dt;
+                element.normal_part.impulse = (element.normal_part.impulse
+                    * params.warmstart_coefficient)
+                    .min(element.normal_part.max_impulse);
             }
 
             // Tangent part.

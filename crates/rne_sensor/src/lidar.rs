@@ -43,6 +43,7 @@ use rne_math::Vec3;
 use rne_physics::{PhysicsBackend, PhysicsError, PhysicsWorldId, RaycastHit, RaycastQuery};
 use rne_world::Transform3;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
 
@@ -722,7 +723,8 @@ fn evaluate_ray<R: LidarRaycaster + ?Sized>(
     };
     sort_hits(&mut hits);
 
-    let footprint = sample_beam_footprint(backend, physics_world, ray, spec, random, noise_key)?;
+    let footprint =
+        sample_beam_footprint(backend, physics_world, ray, spec, random, noise_key, &hits)?;
     let mut returns = surface_returns(
         world, ray, &hits, footprint, spec, atmosphere, random, noise_key,
     );
@@ -824,6 +826,7 @@ fn sample_beam_footprint<R: LidarRaycaster + ?Sized>(
     spec: &LidarSpec,
     random: &KeyedRandom,
     noise_key: SensorNoiseKey,
+    central_hits: &[RaycastHit],
 ) -> Result<BeamFootprint, RayFailure> {
     let samples = u32::from(spec.beam_sample_count);
     let half_divergence = spec.beam_divergence_rad.max(0.0) / 2.0;
@@ -855,20 +858,24 @@ fn sample_beam_footprint<R: LidarRaycaster + ?Sized>(
             continue;
         }
 
-        let hits = backend.lidar_raycast(
-            physics_world,
-            RaycastQuery {
-                origin_m: ray.origin_m,
-                direction,
-                max_distance_m: spec.max_range_m,
-            },
-        );
-        let hits = match hits {
-            Ok(hits) => hits,
-            Err(_) if spec.failure_behavior == LidarFailureBehavior::DropRay => {
-                return Err(RayFailure::Skip)
+        let hits: Cow<'_, [RaycastHit]> = if sample == 0 {
+            Cow::Borrowed(central_hits)
+        } else {
+            let hits = backend.lidar_raycast(
+                physics_world,
+                RaycastQuery {
+                    origin_m: ray.origin_m,
+                    direction,
+                    max_distance_m: spec.max_range_m,
+                },
+            );
+            match hits {
+                Ok(hits) => Cow::Owned(hits),
+                Err(_) if spec.failure_behavior == LidarFailureBehavior::DropRay => {
+                    return Err(RayFailure::Skip)
+                }
+                Err(_) => return Err(RayFailure::Scan),
             }
-            Err(_) => return Err(RayFailure::Scan),
         };
         if let Some(nearest) = hits
             .iter()
@@ -1379,6 +1386,7 @@ mod tests {
         entity: Entity,
         near_m: f64,
         far_m: f64,
+        raycasts: std::sync::atomic::AtomicUsize,
     }
 
     impl PhysicsBackend for EdgePhysics {
@@ -1406,6 +1414,8 @@ mod tests {
             _: PhysicsWorldId,
             query: RaycastQuery,
         ) -> Result<Vec<RaycastHit>, PhysicsError> {
+            self.raycasts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let distance = if query.direction.y >= 0.0 {
                 self.near_m
             } else {
@@ -2038,6 +2048,7 @@ mod tests {
             entity: edge,
             near_m: 10.0,
             far_m: 30.0,
+            raycasts: std::sync::atomic::AtomicUsize::new(0),
         };
         let axial = LidarSpec {
             ray_count: 1,
@@ -2070,6 +2081,13 @@ mod tests {
                 ..axial
             },
             key,
+        );
+
+        // The central hit is shared with footprint sample zero; only the other
+        // fifteen divergent samples need fresh physics queries.
+        assert_eq!(
+            physics.raycasts.load(std::sync::atomic::Ordering::Relaxed),
+            17
         );
 
         let axial_range = single_sample.points_m[0].length();

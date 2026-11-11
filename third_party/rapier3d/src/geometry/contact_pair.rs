@@ -311,9 +311,22 @@ pub struct SolverContact {
     pub warmstart_impulse: Real,
     /// Impulse used to warmstart the solve for the friction constraints.
     pub warmstart_tangent_impulse: TangentImpulse<Real>,
+    /// RNE patch: upper bound of the normal contact force, in force units.
+    ///
+    /// Defaults to `Real::MAX` (a rigid unilateral contact). A finite value
+    /// lets a contact yield once the bound is reached, which models plastic
+    /// or viscoplastic ground such as sand and mud. The solver converts it to
+    /// a per-substep impulse bound; friction stays bounded by the clamped
+    /// normal impulse.
+    pub max_normal_force: Real,
 }
 
 impl SolverContact {
+    /// RNE patch: index of the manifold point this solver contact was generated from.
+    pub fn contact_id(&self) -> u8 {
+        self.contact_id
+    }
+
     /// Should we treat this contact as a bouncy contact?
     /// If `true`, use [`Self::restitution`].
     pub fn is_bouncy(&self) -> bool {

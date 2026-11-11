@@ -63,11 +63,17 @@ impl RenderScene {
 
     /// Builds an identity-transform item from CPU-generated triangle geometry.
     pub fn item_from_dynamic_mesh(mesh: TriangleMesh, color_rgba: [f32; 4]) -> RenderSceneItem {
+        Self::item_from_shared_mesh(Arc::new(mesh), color_rgba)
+    }
+
+    /// Builds an identity-transform item while retaining shared mesh storage.
+    /// Useful for cached terrain LODs and other immutable procedural geometry.
+    pub fn item_from_shared_mesh(mesh: Arc<TriangleMesh>, color_rgba: [f32; 4]) -> RenderSceneItem {
         RenderSceneItem {
             transform: MathTransform3::IDENTITY,
             shape: VisualShape::DynamicMesh,
             color_rgba,
-            mesh: Some(Arc::new(mesh)),
+            mesh: Some(mesh),
             base_color_texture: None,
             material: PbrMaterial::default(),
         }

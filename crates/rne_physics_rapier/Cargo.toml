@@ -11,6 +11,8 @@ repository.workspace = true
 workspace = true
 
 [features]
+# Opt-in vectorized contact solving; incompatible with Rapier enhanced-determinism.
+simd = ["rapier3d/simd-stable"]
 # Requires the repository's Rapier patch; default builds also compile against
 # unmodified crates.io Rapier. See ADR 030 before enabling in another workspace.
 experimental-armature = []

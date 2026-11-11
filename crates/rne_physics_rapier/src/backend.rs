@@ -26,12 +26,13 @@ use rne_math::Vec3;
 use rne_physics::RevoluteJointArmature;
 use rne_physics::{
     Collider, CommandedKinematicPose, CompoundCollider, ContactEvent, ContactPointSample,
-    ConvexCollider, ExternalBodyWrench, FixedJointDesc, GravityScale, JointActuation,
-    JointEffortMeasurement, JointMotor, JointMotorGainModel, JointPassiveDynamics, JointState,
-    MultibodyLink, PhysicsBackend, PhysicsBackendManifest, PhysicsBackendRepeatability,
-    PhysicsCapability, PhysicsError, PhysicsOwnedPose, PhysicsWorldDesc, PhysicsWorldId,
-    PrismaticJointDesc, RaycastHit, RaycastQuery, RevoluteJointDesc, RigidBody, RigidBodyInertia,
-    RigidBodyType, SelfCollisionExclusion,
+    ConvexCollider, ExternalBodyWrench, FixedJointDesc, GravityScale, GroundContactSample,
+    GroundMaterial, GroundSurface, JointActuation, JointEffortMeasurement, JointMotor,
+    JointMotorGainModel, JointPassiveDynamics, JointState, MultibodyLink, PhysicsBackend,
+    PhysicsBackendManifest, PhysicsBackendRepeatability, PhysicsCapability, PhysicsError,
+    PhysicsOwnedPose, PhysicsWorldDesc, PhysicsWorldId, PrismaticJointDesc, RaycastHit,
+    RaycastQuery, RevoluteJointDesc, RigidBody, RigidBodyInertia, RigidBodyType,
+    SelfCollisionExclusion,
 };
 #[cfg(feature = "position-motor-diagnostics")]
 use rne_physics::{JointPositionMotorDiagnostics, PositionMotorDiagnosticInterval};
@@ -80,18 +81,37 @@ struct RapierWorldState {
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
     query_pipeline: QueryPipeline,
+    /// A collider was inserted or removed since the query pipeline was last
+    /// fully rebuilt, so direct queries after synchronization need a rebuild.
+    query_pipeline_needs_rebuild: bool,
     entity_to_body: HashMap<Entity, RigidBodyHandle>,
     body_to_entity: HashMap<RigidBodyHandle, Entity>,
     entity_to_collider: HashMap<Entity, ColliderHandle>,
     collider_to_entity: HashMap<ColliderHandle, Entity>,
     /// Exact generational owner tokens; only keyed lookups affect pair filtering.
     collider_owners: HashMap<ColliderHandle, Entity>,
+    /// Per-compound-child friction overrides, keyed by Rapier's compound subshape ID.
+    compound_part_frictions: HashMap<ColliderHandle, HashMap<u32, f32>>,
+    /// Ground materials of colliders carrying a [`GroundSurface`].
+    ground_materials: HashMap<ColliderHandle, GroundMaterial>,
+    /// Original parent-relative pose of deformable ground colliders, which are
+    /// lowered by their soil depth and given an equal contact skin.
+    ground_lowered_poses: HashMap<ColliderHandle, Isometry<Real>>,
+    /// Contacts with ground surfaces from the last completed step.
+    ground_contacts: Vec<GroundContactSample>,
+    /// Supporting ground subshape per touching shape, refreshed before each step.
+    ground_supports: HashMap<(ColliderHandle, ColliderHandle, u32), u32>,
     entity_to_joint: HashMap<Entity, ImpulseJointHandle>,
     entity_to_multibody_joint: HashMap<Entity, MultibodyJointHandle>,
     /// Welds on articulated links: a [`FixedJointDesc`] on an entity whose own
     /// articulation joint is revolute or prismatic becomes an extra impulse joint,
     /// closing a loop, while the articulation joint keeps its coordinate.
     entity_to_attachment: HashMap<Entity, ImpulseJointHandle>,
+    /// Deterministic per-sync entity snapshot shared by all ECS-to-Rapier passes.
+    ///
+    /// The vector is refreshed after stale-handle cleanup and retains its capacity
+    /// between syncs, avoiding repeated allocation and sorting of the same world.
+    entity_snapshot: Vec<Entity>,
     contacts: Vec<ContactEvent>,
     contact_points: Vec<ContactPointSample>,
     /// Bodies carrying a one-step disturbance force, cleared after the next step.
@@ -125,6 +145,15 @@ struct PositionMotorDiagnosticTarget {
 
 struct OwnerCollisionHooks<'a> {
     owners: &'a HashMap<ColliderHandle, Entity>,
+    compound_part_frictions: &'a HashMap<ColliderHandle, HashMap<u32, f32>>,
+    ground_materials: &'a HashMap<ColliderHandle, GroundMaterial>,
+    /// Duration of one solver substep, in seconds.
+    substep_dt_s: f32,
+    /// Duration of the whole step, in seconds.
+    step_dt_s: f32,
+    /// Supporting ground subshape per (ground, touching collider, touching
+    /// subshape), chosen from the previous step's manifolds.
+    ground_supports: &'a HashMap<(ColliderHandle, ColliderHandle, u32), u32>,
 }
 
 impl OwnerCollisionHooks<'_> {
@@ -165,14 +194,359 @@ impl PhysicsHooks for OwnerCollisionHooks<'_> {
     fn filter_intersection_pair(&self, context: &PairFilterContext<'_>) -> bool {
         self.allows_pair(context)
     }
+
+    fn modify_solver_contacts(&self, context: &mut ContactModificationContext<'_>) {
+        self.apply_compound_part_friction(context);
+        self.apply_ground_material(context);
+    }
+}
+
+impl OwnerCollisionHooks<'_> {
+    fn apply_compound_part_friction(&self, context: &mut ContactModificationContext<'_>) {
+        let friction1 = self
+            .compound_part_frictions
+            .get(&context.collider1)
+            .and_then(|parts| parts.get(&context.manifold.subshape1))
+            .copied();
+        let friction2 = self
+            .compound_part_frictions
+            .get(&context.collider2)
+            .and_then(|parts| parts.get(&context.manifold.subshape2))
+            .copied();
+        let combined_friction = match (friction1, friction2) {
+            (Some(friction1), Some(friction2)) => (friction1 + friction2) * 0.5,
+            (Some(friction), None) => {
+                (friction + context.colliders[context.collider2].friction()) * 0.5
+            }
+            (None, Some(friction)) => {
+                (context.colliders[context.collider1].friction() + friction) * 0.5
+            }
+            (None, None) => return,
+        };
+
+        if !combined_friction.is_finite() {
+            return;
+        }
+
+        // Compound-part friction deliberately uses the public material rule:
+        // average the selected child's material with its opposing collider.
+        for contact in &mut *context.solver_contacts {
+            contact.friction = combined_friction;
+        }
+    }
+
+    /// Lets deformable ground yield and applies ground friction limits.
+    ///
+    /// Each penetrating contact is treated as resting on ground already
+    /// displaced to its current depth (no push-out), and its normal force is
+    /// capped at the ground's bearing capacity at that depth, so a larger load
+    /// keeps sinking the contact. See [`rne_physics::SoilDeformation`].
+    fn apply_ground_material(&self, context: &mut ContactModificationContext<'_>) {
+        let (ground_handle, other_handle, ground_is_first) =
+            if self.ground_materials.contains_key(&context.collider1) {
+                (context.collider1, context.collider2, true)
+            } else if self.ground_materials.contains_key(&context.collider2) {
+                (context.collider2, context.collider1, false)
+            } else {
+                return;
+            };
+        if self.ground_materials.contains_key(&other_handle) {
+            // Ground against ground keeps Rapier's rigid behaviour.
+            return;
+        }
+        let material = self.ground_materials[&ground_handle];
+        let ground_normal = if ground_is_first {
+            *context.normal
+        } else {
+            -*context.normal
+        };
+        let other_subshape = if ground_is_first {
+            context.manifold.subshape2
+        } else {
+            context.manifold.subshape1
+        };
+        let soil = material.deformation;
+        let ground_subshape = if ground_is_first {
+            context.manifold.subshape1
+        } else {
+            context.manifold.subshape2
+        };
+        if soil.is_some()
+            && self
+                .ground_supports
+                .get(&(ground_handle, other_handle, other_subshape))
+                .is_some_and(|support| *support != ground_subshape)
+        {
+            // Another ground face supports this shape; drop the skin-rounded
+            // edge contact and forget its displaced depth.
+            context.solver_contacts.clear();
+            *context.user_data = 0;
+            return;
+        }
+        let radius_m = soil.map_or(0.0, |soil| {
+            contact_radius_m(&context.colliders[other_handle], other_subshape)
+                .map_or(soil.min_contact_radius_m, |radius| {
+                    radius.max(soil.min_contact_radius_m)
+                })
+        });
+        let ground_body = if ground_is_first {
+            context.rigid_body1
+        } else {
+            context.rigid_body2
+        };
+        let other_body = if ground_is_first {
+            context.rigid_body2
+        } else {
+            context.rigid_body1
+        };
+        let velocity_at = |handle: Option<RigidBodyHandle>, point: &Point<Real>| {
+            handle
+                .and_then(|handle| context.bodies.get(handle))
+                .map_or_else(Vector::zeros, |body| body.velocity_at_point(point))
+        };
+        // Per-manifold soil state persisted in the manifold's user data.
+        let stored =
+            soil.map(|soil| SoilContactState::decode(*context.user_data, soil.max_sinkage_m));
+        let stored_reference_m = stored.and_then(|state| state.reference_m);
+        let mut reference_m = stored_reference_m.unwrap_or(0.0);
+        let creep_m = stored.map_or(0.0, |state| state.creep_m);
+        let mut creep_rate_m_s: f64 = 0.0;
+        let substep_dt_s = f64::from(self.substep_dt_s);
+        for contact in &mut *context.solver_contacts {
+            let base_friction = contact.friction.min(material.max_friction);
+            let Some(soil) = soil else {
+                contact.friction = base_friction;
+                continue;
+            };
+            let sinkage_m = f64::from((-contact.dist).max(0.0));
+            let sink_velocity_m_s = f64::from(
+                -(velocity_at(other_body, &contact.point)
+                    - velocity_at(ground_body, &contact.point))
+                .dot(&ground_normal),
+            );
+            contact.friction = base_friction + soil.bulldozing_friction(sinkage_m, radius_m) as f32;
+            contact.restitution = 0.0;
+            if sinkage_m >= soil.max_sinkage_m {
+                // Firm layer: rigid support, corrected back to the layer depth.
+                contact.dist += soil.max_sinkage_m as f32;
+                reference_m = reference_m.max(soil.max_sinkage_m);
+                continue;
+            }
+            // Creep has already let the ground flow by `creep_m` under this
+            // contact, so it bears load as if that much shallower.
+            let bearing_depth_m = (sinkage_m - creep_m).max(0.0);
+            let static_n = soil.static_bearing_n(bearing_depth_m, radius_m);
+            let previous_load_n = if substep_dt_s > 0.0 {
+                f64::from(contact.warmstart_impulse.max(0.0)) / substep_dt_s
+            } else {
+                0.0
+            };
+            // Ground yields to the depth whose static bearing matches the load
+            // it carried last step; it never springs back. A new manifold
+            // adopts the current depth, as the ground there is already displaced.
+            let yielded_m = if stored_reference_m.is_some() {
+                sinkage_m.min(soil.equilibrium_sinkage_m(previous_load_n, radius_m) + creep_m)
+            } else {
+                sinkage_m
+            };
+            let point_reference_m = reference_m.max(yielded_m);
+            reference_m = point_reference_m;
+            // Viscoplastic creep: under load the ground keeps flowing at a speed
+            // proportional to the step-average load relative to static
+            // capacity, which lowers the bearing capacity so the contact sinks
+            // smoothly at the creep speed while carrying its load.
+            if soil.creep_velocity_m_s > 0.0 {
+                let step_load_n = context
+                    .manifold
+                    .points
+                    .get(usize::from(contact.contact_id()))
+                    .map_or(previous_load_n, |point| {
+                        f64::from(point.data.impulse.max(0.0)) / f64::from(self.step_dt_s)
+                    });
+                let load_ratio = if static_n > 0.0 {
+                    (step_load_n / static_n).min(1.0)
+                } else if step_load_n > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                creep_rate_m_s = creep_rate_m_s.max(soil.creep_velocity_m_s * load_ratio);
+            }
+            // The solver treats the displaced depth as the surface: above it the
+            // contact is separated (a hole left in the ground), below it only
+            // compliance drift is pushed back, and the normal force is capped at
+            // the bearing capacity, so a larger load sinks the contact further.
+            contact.dist += point_reference_m as f32;
+            let capacity_n = soil.bearing_capacity_n(bearing_depth_m, radius_m, sink_velocity_m_s);
+            contact.max_normal_force = if capacity_n.is_finite() {
+                capacity_n.min(f64::from(Real::MAX)) as Real
+            } else {
+                Real::MAX
+            };
+        }
+        if let Some(soil) = soil {
+            *context.user_data = SoilContactState {
+                reference_m: Some(reference_m),
+                creep_m: (creep_m + creep_rate_m_s * f64::from(self.step_dt_s))
+                    .min(soil.max_sinkage_m),
+            }
+            .encode(soil.max_sinkage_m);
+        }
+    }
+}
+
+/// Soil state of one ground contact manifold, packed into Rapier's 32-bit
+/// manifold user data as two 16-bit fractions of the soil depth: the depth
+/// already displaced (0 = not yet set) and the accumulated creep.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SoilContactState {
+    reference_m: Option<f64>,
+    creep_m: f64,
+}
+
+impl SoilContactState {
+    const DEPTH_STEPS: f64 = 65_534.0;
+    const CREEP_STEPS: f64 = 65_535.0;
+
+    fn decode(bits: u32, soil_depth_m: f64) -> Self {
+        let depth = bits & 0xFFFF;
+        Self {
+            reference_m: (depth != 0)
+                .then(|| f64::from(depth - 1) / Self::DEPTH_STEPS * soil_depth_m),
+            creep_m: f64::from(bits >> 16) / Self::CREEP_STEPS * soil_depth_m,
+        }
+    }
+
+    fn encode(self, soil_depth_m: f64) -> u32 {
+        let depth = self.reference_m.map_or(0, |reference_m| {
+            // Round up so a decoded depth never lies above the true one.
+            ((reference_m / soil_depth_m).clamp(0.0, 1.0) * Self::DEPTH_STEPS).ceil() as u32 + 1
+        });
+        // Round down: creep under one quantum per step must still accumulate,
+        // so carry it stochastically-free by rounding to nearest instead.
+        let creep =
+            ((self.creep_m / soil_depth_m).clamp(0.0, 1.0) * Self::CREEP_STEPS).round() as u32;
+        (creep << 16) | depth
+    }
+}
+
+#[cfg(test)]
+mod soil_contact_state_tests {
+    use super::SoilContactState;
+
+    #[test]
+    fn packs_depth_and_creep_without_raising_the_depth() {
+        let depth_m = 0.1;
+        assert_eq!(SoilContactState::decode(0, depth_m).reference_m, None);
+        for (reference_m, creep_m) in [(0.0, 0.0), (0.0123, 0.004), (0.1, 0.1)] {
+            let state = SoilContactState {
+                reference_m: Some(reference_m),
+                creep_m,
+            };
+            let decoded = SoilContactState::decode(state.encode(depth_m), depth_m);
+            let decoded_reference_m = decoded.reference_m.unwrap();
+            assert!(decoded_reference_m >= reference_m - 1.0e-12);
+            assert!(decoded_reference_m - reference_m < 2.0e-6);
+            assert!((decoded.creep_m - creep_m).abs() < 1.0e-6);
+        }
+    }
+}
+
+/// Radius of a rounded contact shape (ball or capsule), if the collider's
+/// contacting part has one.
+fn contact_radius_m(collider: &rapier3d::geometry::Collider, subshape: u32) -> Option<f64> {
+    let shape = collider.shape();
+    let part = match shape.as_compound() {
+        Some(compound) => compound.shapes().get(subshape as usize)?.1.as_ref(),
+        None => shape,
+    };
+    if let Some(ball) = part.as_ball() {
+        return Some(f64::from(ball.radius));
+    }
+    if let Some(capsule) = part.as_capsule() {
+        return Some(f64::from(capsule.radius));
+    }
+    if let Some(cylinder) = part.as_cylinder() {
+        return Some(f64::from(cylinder.radius));
+    }
+    None
+}
+
+/// Chooses, for each collider part touching a ground surface across several
+/// ground subshapes (height-field triangles), the one subshape whose contact
+/// normal is closest to the ground's up axis in the previous step.
+///
+/// Deformable ground is lowered and given a contact skin; the skin rounds the
+/// edges of neighbouring triangles, so a shape sunk into it also touches those
+/// edges with tilted normals. Only the supporting face carries the contact.
+fn select_ground_supports(state: &mut RapierWorldState) {
+    state.ground_supports.clear();
+    if state.ground_materials.is_empty() {
+        return;
+    }
+    let mut best: HashMap<(ColliderHandle, ColliderHandle, u32), (f32, u32, usize)> =
+        HashMap::new();
+    for pair in state.narrow_phase.contact_pairs() {
+        let (ground, other, ground_is_first) =
+            if state.ground_materials.contains_key(&pair.collider1) {
+                (pair.collider1, pair.collider2, true)
+            } else if state.ground_materials.contains_key(&pair.collider2) {
+                (pair.collider2, pair.collider1, false)
+            } else {
+                continue;
+            };
+        let Some(ground_collider) = state.colliders.get(ground) else {
+            continue;
+        };
+        let up = ground_collider.position().rotation * Vector::y();
+        for manifold in &pair.manifolds {
+            if manifold.points.is_empty() {
+                continue;
+            }
+            let (ground_subshape, other_subshape, normal) = if ground_is_first {
+                (manifold.subshape1, manifold.subshape2, manifold.data.normal)
+            } else {
+                (
+                    manifold.subshape2,
+                    manifold.subshape1,
+                    -manifold.data.normal,
+                )
+            };
+            let score = normal.dot(&up);
+            let entry =
+                best.entry((ground, other, other_subshape))
+                    .or_insert((score, ground_subshape, 0));
+            entry.2 += 1;
+            if score > entry.0 + 1.0e-4 || (score >= entry.0 - 1.0e-4 && ground_subshape < entry.1)
+            {
+                entry.0 = score;
+                entry.1 = ground_subshape;
+            }
+        }
+    }
+    state.ground_supports.extend(
+        best.into_iter()
+            .filter(|(_, (_, _, count))| *count > 1)
+            .map(|(key, (_, subshape, _))| (key, subshape)),
+    );
 }
 
 fn advance_rapier_pipeline(state: &mut RapierWorldState) {
+    select_ground_supports(state);
+    let solver_iterations = state.integration_parameters.num_solver_iterations.get() as f32;
     let owner_hooks = OwnerCollisionHooks {
         owners: &state.collider_owners,
+        compound_part_frictions: &state.compound_part_frictions,
+        ground_materials: &state.ground_materials,
+        substep_dt_s: state.integration_parameters.dt / solver_iterations,
+        step_dt_s: state.integration_parameters.dt,
+        ground_supports: &state.ground_supports,
     };
     // Retain the original unit hook when this world has no marked collider.
-    let hooks: &dyn PhysicsHooks = if state.collider_owners.is_empty() {
+    let hooks: &dyn PhysicsHooks = if state.collider_owners.is_empty()
+        && state.compound_part_frictions.is_empty()
+        && state.ground_materials.is_empty()
+    {
         &()
     } else {
         &owner_hooks
@@ -218,6 +592,38 @@ impl RapierBackend {
 
     fn world_mut(&mut self, id: PhysicsWorldId) -> Result<&mut RapierWorldState, PhysicsError> {
         self.worlds.get_mut(&id).ok_or(PhysicsError::WorldNotFound)
+    }
+
+    /// Configures contact stabilization for a world's physical length scale.
+    ///
+    /// `allowed_penetration_m` is the penetration slop in metres, independent of
+    /// Rapier's length unit. Frequency and damping control contact compliance;
+    /// smaller colliders may need tighter slop and stiffer contacts than defaults.
+    /// Returns false without changing the world for an unknown world or invalid
+    /// parameters (non-finite, non-positive, greater than 1e6, or underflowing f32).
+    /// Existing worlds retain Rapier defaults unless this method is called.
+    pub fn set_contact_stabilization(
+        &mut self,
+        id: PhysicsWorldId,
+        allowed_penetration_m: f64,
+        natural_frequency_hz: f64,
+        damping_ratio: f64,
+    ) -> bool {
+        let values = [allowed_penetration_m, natural_frequency_hz, damping_ratio];
+        if values
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0 || *v > 1.0e6 || (*v as f32) == 0.0)
+        {
+            return false;
+        }
+        let Ok(state) = self.world_mut(id) else {
+            return false;
+        };
+        let params = &mut state.integration_parameters;
+        params.normalized_allowed_linear_error = allowed_penetration_m as f32 / params.length_unit;
+        params.contact_natural_frequency = natural_frequency_hz as f32;
+        params.contact_damping_ratio = damping_ratio as f32;
+        true
     }
 
     /// Applies a velocity-equivalent disturbance to an entity's rigid body over the
@@ -274,11 +680,17 @@ impl RapierBackend {
             ) else {
                 continue;
             };
+            // Contact skins (deformable ground) offset the effective surface.
+            let skin = [pair.collider1, pair.collider2]
+                .iter()
+                .filter_map(|handle| state.colliders.get(*handle))
+                .map(|collider| collider.contact_skin())
+                .sum::<Real>();
             let Some(distance) = pair
                 .manifolds
                 .iter()
                 .flat_map(|m| m.points.iter())
-                .map(|point| point.dist)
+                .map(|point| point.dist - skin)
                 .reduce(f32::min)
             else {
                 continue;
@@ -319,6 +731,67 @@ impl RapierBackend {
         };
         collider.set_friction(friction);
         true
+    }
+
+    /// Overrides friction for one child of an already-created compound collider.
+    ///
+    /// The override applies only while that child contacts another collider. Its
+    /// effective solver friction is the arithmetic mean of `friction` and the
+    /// other collider's current friction. Returns false for an unknown world or
+    /// entity, a non-compound collider, an invalid part index, or a non-finite or
+    /// negative friction value.
+    pub fn set_compound_part_friction(
+        &mut self,
+        physics_world: PhysicsWorldId,
+        entity: Entity,
+        part_index: u32,
+        friction: f32,
+    ) -> bool {
+        if !friction.is_finite() || friction < 0.0 {
+            return false;
+        }
+        let Ok(state) = self.world_mut(physics_world) else {
+            return false;
+        };
+        let Some(handle) = state.entity_to_collider.get(&entity).copied() else {
+            return false;
+        };
+        let Some(collider) = state.colliders.get(handle) else {
+            return false;
+        };
+        let Some(compound) = collider.shape().as_compound() else {
+            return false;
+        };
+        if usize::try_from(part_index)
+            .ok()
+            .is_none_or(|index| index >= compound.shapes().len())
+        {
+            return false;
+        }
+
+        state
+            .compound_part_frictions
+            .entry(handle)
+            .or_default()
+            .insert(part_index, friction);
+        if let Some(collider) = state.colliders.get_mut(handle) {
+            collider
+                .set_active_hooks(collider.active_hooks() | ActiveHooks::MODIFY_SOLVER_CONTACTS);
+            collider.set_position(*collider.position());
+        }
+        true
+    }
+
+    /// Contacts with [`GroundSurface`] colliders from the last completed step.
+    ///
+    /// Sinkage is the penetration below the undisturbed surface when the step
+    /// began; sink velocity and normal force describe the completed step.
+    /// Samples are ordered by entity, ground entity and contact position.
+    pub fn ground_contacts(
+        &self,
+        physics_world: PhysicsWorldId,
+    ) -> Result<&[GroundContactSample], PhysicsError> {
+        Ok(&self.world(physics_world)?.ground_contacts)
     }
 
     /// Reads the generalized position of an entity's single-DoF multibody joint:
@@ -443,14 +916,17 @@ fn remove_position_motor_diagnostic_components(world: &mut World, state: &mut Ra
 }
 
 #[cfg(feature = "position-motor-diagnostics")]
-fn sync_position_motor_diagnostic_targets(world: &mut World, state: &mut RapierWorldState) {
+fn sync_position_motor_diagnostic_targets(world: &World, state: &mut RapierWorldState) {
     if !state.position_motor_diagnostics_enabled {
         return;
     }
-    state.pending_position_motor_diagnostics = sorted_entities(world)
-        .into_iter()
-        .filter_map(|entity| position_motor_diagnostic_target(world, state, entity))
-        .collect();
+    state.pending_position_motor_diagnostics.clear();
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
+        if let Some(target) = position_motor_diagnostic_target(world, state, entity) {
+            state.pending_position_motor_diagnostics.push(target);
+        }
+    }
 }
 
 #[cfg(feature = "position-motor-diagnostics")]
@@ -617,14 +1093,21 @@ impl PhysicsBackend for RapierBackend {
                 multibody_joints: MultibodyJointSet::new(),
                 ccd_solver: CCDSolver::new(),
                 query_pipeline: QueryPipeline::new(),
+                query_pipeline_needs_rebuild: false,
                 entity_to_body: HashMap::new(),
                 body_to_entity: HashMap::new(),
                 entity_to_collider: HashMap::new(),
                 collider_to_entity: HashMap::new(),
                 collider_owners: HashMap::new(),
+                compound_part_frictions: HashMap::new(),
+                ground_materials: HashMap::new(),
+                ground_lowered_poses: HashMap::new(),
+                ground_contacts: Vec::new(),
+                ground_supports: HashMap::new(),
                 entity_to_joint: HashMap::new(),
                 entity_to_multibody_joint: HashMap::new(),
                 entity_to_attachment: HashMap::new(),
+                entity_snapshot: Vec::new(),
                 contacts: Vec::new(),
                 contact_points: Vec::new(),
                 impulse_forced: Vec::new(),
@@ -660,11 +1143,13 @@ impl PhysicsBackend for RapierBackend {
             remove_position_motor_diagnostic_components(world, state);
         }
 
+        refresh_entity_snapshot(world, state);
+
         // Iterate in a stable entity order so Rapier handle assignment and the
         // resulting solver order are deterministic regardless of ECS archetype
         // layout (see AGENTS.md determinism requirements).
-        for entity in sorted_entities(world) {
-            let transform = world_transform_of(world, entity);
+        for index in 0..state.entity_snapshot.len() {
+            let entity = state.entity_snapshot[index];
             let Some(rigid_body) = world.get::<RigidBody>(entity) else {
                 continue;
             };
@@ -691,11 +1176,15 @@ impl PhysicsBackend for RapierBackend {
                     return Err(PhysicsError::InitializationFailed);
                 }
             }
-            if collider.is_none() && world.get::<MultibodyLink>(entity).is_none() {
+            // Existing bodies must still visit `sync_entity_collider` when the
+            // collider component was removed. New collider-free plain bodies
+            // remain outside the native world as before.
+            if collider.is_none()
+                && world.get::<MultibodyLink>(entity).is_none()
+                && !state.entity_to_body.contains_key(&entity)
+            {
                 continue;
             }
-
-            let isometry = transform_to_isometry(&transform);
 
             if let Some(body_handle) = state.entity_to_body.get(&entity).copied() {
                 // A marked reduced-coordinate member's pose and velocity are
@@ -707,6 +1196,8 @@ impl PhysicsBackend for RapierBackend {
                 let physics_owned = world.get::<PhysicsOwnedPose>(entity).is_some();
                 if let Some(body) = state.bodies.get_mut(body_handle) {
                     if !physics_owned {
+                        let transform = world_transform_of(world, entity);
+                        let isometry = transform_to_isometry(&transform);
                         if rigid_body.body_type == RigidBodyType::Kinematic
                             && world.get::<CommandedKinematicPose>(entity).is_some()
                         {
@@ -729,9 +1220,12 @@ impl PhysicsBackend for RapierBackend {
                 }
                 sync_entity_collider(world, state, entity, body_handle, collider)?;
                 sync_collider_owner(world, state, entity);
+                sync_ground_surface(world, state, entity);
                 continue;
             }
 
+            let transform = world_transform_of(world, entity);
+            let isometry = transform_to_isometry(&transform);
             let mut builder =
                 RigidBodyBuilder::new(body_type_to_rapier(rigid_body.body_type)).position(isometry);
             if let Some(scale) = world.get::<GravityScale>(entity) {
@@ -783,15 +1277,20 @@ impl PhysicsBackend for RapierBackend {
                 );
                 state.entity_to_collider.insert(entity, collider_handle);
                 state.collider_to_entity.insert(collider_handle, entity);
+                state.query_pipeline_needs_rebuild = true;
             }
             sync_collider_owner(world, state, entity);
+            sync_ground_surface(world, state, entity);
         }
 
         sync_joints_from_ecs(world, state)?;
         apply_joint_motors(world, state)?;
         #[cfg(feature = "position-motor-diagnostics")]
         sync_position_motor_diagnostic_targets(world, state);
-        state.query_pipeline.update(&state.colliders);
+        if state.query_pipeline_needs_rebuild {
+            state.query_pipeline.update(&state.colliders);
+            state.query_pipeline_needs_rebuild = false;
+        }
 
         Ok(())
     }
@@ -801,12 +1300,20 @@ impl PhysicsBackend for RapierBackend {
         state.integration_parameters.dt = dt.as_seconds().value() as f32;
         state.contacts.clear();
         state.contact_points.clear();
+        state.ground_contacts.clear();
         #[cfg(feature = "position-motor-diagnostics")]
         state.completed_position_motor_diagnostics.clear();
 
         advance_rapier_pipeline(state);
+        // `PhysicsPipeline::step` incrementally refreshes this pipeline after
+        // final collider positions, so rebuilding it here would duplicate that
+        // work and is unnecessary before queries.
 
-        state.completed_joint_efforts = std::mem::take(&mut state.pending_joint_efforts);
+        std::mem::swap(
+            &mut state.completed_joint_efforts,
+            &mut state.pending_joint_efforts,
+        );
+        state.pending_joint_efforts.clear();
         #[cfg(feature = "position-motor-diagnostics")]
         collect_completed_position_motor_diagnostics(state, dt);
 
@@ -819,8 +1326,6 @@ impl PhysicsBackend for RapierBackend {
                 body.reset_torques(true);
             }
         }
-
-        state.query_pipeline.update(&state.colliders);
 
         for contact_pair in state.narrow_phase.contact_pairs() {
             if !contact_pair.has_any_active_contact {
@@ -916,6 +1421,7 @@ impl PhysicsBackend for RapierBackend {
                 impulse,
             });
         }
+        collect_ground_contacts(state);
 
         state.contact_points.sort_by(|left, right| {
             left.entity_a
@@ -1103,11 +1609,23 @@ impl PhysicsBackend for RapierBackend {
             filter,
             |collider_handle, intersection| {
                 if let Some(entity) = state.collider_to_entity.get(&collider_handle).copied() {
+                    // Deformable ground is lowered by its contact skin; report
+                    // the hit on the undisturbed surface the skin represents.
+                    let skin = state
+                        .colliders
+                        .get(collider_handle)
+                        .map_or(0.0, |collider| collider.contact_skin());
+                    let incidence = -ray.dir.dot(&intersection.normal);
+                    let time_of_impact = if skin > 0.0 && incidence > 0.2 {
+                        (intersection.time_of_impact - skin / incidence).max(0.0)
+                    } else {
+                        intersection.time_of_impact
+                    };
                     intersections.push(RaycastHit {
                         entity,
-                        point_m: vec3_from_point(ray.point_at(intersection.time_of_impact)),
+                        point_m: vec3_from_point(ray.point_at(time_of_impact)),
                         normal: vec3_from_rapier(intersection.normal),
-                        distance_m: intersection.time_of_impact as f64,
+                        distance_m: time_of_impact as f64,
                     });
                 }
                 true
@@ -1189,6 +1707,126 @@ impl PhysicsBackend for RapierBackend {
     }
 }
 
+/// Records every contact point between a body and a ground surface collider.
+fn collect_ground_contacts(state: &mut RapierWorldState) {
+    if state.ground_materials.is_empty() {
+        return;
+    }
+    let dt_s = f64::from(state.integration_parameters.dt);
+    for contact_pair in state.narrow_phase.contact_pairs() {
+        let (ground_handle, other_handle, ground_is_first) =
+            if state.ground_materials.contains_key(&contact_pair.collider1) {
+                (contact_pair.collider1, contact_pair.collider2, true)
+            } else if state.ground_materials.contains_key(&contact_pair.collider2) {
+                (contact_pair.collider2, contact_pair.collider1, false)
+            } else {
+                continue;
+            };
+        if state.ground_materials.contains_key(&other_handle) {
+            continue;
+        }
+        let material = state.ground_materials[&ground_handle];
+        let (Some(&ground_entity), Some(&entity)) = (
+            state.collider_to_entity.get(&ground_handle),
+            state.collider_to_entity.get(&other_handle),
+        ) else {
+            continue;
+        };
+        let (Some(collider1), Some(collider2)) = (
+            state.colliders.get(contact_pair.collider1),
+            state.colliders.get(contact_pair.collider2),
+        ) else {
+            continue;
+        };
+        let body_velocity = |collider: &rapier3d::geometry::Collider, point: &Point<Real>| {
+            collider
+                .parent()
+                .and_then(|handle| state.bodies.get(handle))
+                .map_or_else(Vector::zeros, |body| body.velocity_at_point(point))
+        };
+        let (ground_collider, other_collider) = if ground_is_first {
+            (collider1, collider2)
+        } else {
+            (collider2, collider1)
+        };
+        for manifold in &contact_pair.manifolds {
+            if manifold.data.solver_contacts.is_empty() {
+                // Not in contact, or an edge contact dropped in favour of the
+                // supporting ground face.
+                continue;
+            }
+            let ground_normal = if ground_is_first {
+                manifold.data.normal
+            } else {
+                -manifold.data.normal
+            };
+            let shape1_position = manifold
+                .subshape_pos1
+                .as_ref()
+                .map_or(*collider1.position(), |child| collider1.position() * child);
+            let shape2_position = manifold
+                .subshape_pos2
+                .as_ref()
+                .map_or(*collider2.position(), |child| collider2.position() * child);
+            for (index, point) in manifold.points.iter().enumerate() {
+                let impulse = f64::from(point.data.impulse.max(0.0));
+                let surface_dist = point.dist - ground_collider.contact_skin();
+                if surface_dist >= 0.0 && impulse == 0.0 {
+                    continue;
+                }
+                // The ground's own witness lies on the lowered firm layer, so
+                // report the touching body's witness point.
+                let point_world = if ground_is_first {
+                    shape2_position * point.local_p2
+                } else {
+                    shape1_position * point.local_p1
+                };
+                let sinkage_m = f64::from((-surface_dist).max(0.0));
+                let sink_velocity_m_s = f64::from(
+                    -(body_velocity(other_collider, &point_world)
+                        - body_velocity(ground_collider, &point_world))
+                    .dot(&ground_normal),
+                );
+                let normal_force_n = if dt_s > 0.0 { impulse / dt_s } else { 0.0 };
+                let solver_contact = manifold
+                    .data
+                    .solver_contacts
+                    .iter()
+                    .find(|contact| usize::from(contact.contact_id()) == index);
+                // The solver's own bound includes creep and the step's sink speed.
+                let bearing_capacity_n = solver_contact
+                    .filter(|contact| contact.max_normal_force < Real::MAX)
+                    .map_or(f64::INFINITY, |contact| f64::from(contact.max_normal_force));
+                let friction = solver_contact.map_or(f64::from(material.friction), |contact| {
+                    f64::from(contact.friction)
+                });
+                let yielding = bearing_capacity_n.is_finite()
+                    && sink_velocity_m_s > 1.0e-4
+                    && normal_force_n >= 0.95 * bearing_capacity_n;
+                state.ground_contacts.push(GroundContactSample {
+                    entity,
+                    ground_entity,
+                    ground_type: material.ground_type,
+                    point_world_m: vec3_from_point(point_world),
+                    ground_normal_world: vec3_from_rapier(ground_normal),
+                    sinkage_m,
+                    sink_velocity_m_s,
+                    normal_force_n,
+                    bearing_capacity_n,
+                    friction,
+                    yielding,
+                });
+            }
+        }
+    }
+    state.ground_contacts.sort_by(|a, b| {
+        (a.entity.index(), a.ground_entity.index())
+            .cmp(&(b.entity.index(), b.ground_entity.index()))
+            .then(a.point_world_m.x.total_cmp(&b.point_world_m.x))
+            .then(a.point_world_m.z.total_cmp(&b.point_world_m.z))
+    });
+}
+
 fn sync_entity_collider(
     world: &World,
     state: &mut RapierWorldState,
@@ -1206,6 +1844,7 @@ fn sync_entity_collider(
             );
             state.entity_to_collider.insert(entity, handle);
             state.collider_to_entity.insert(handle, entity);
+            state.query_pipeline_needs_rebuild = true;
         }
         (Some(handle), Some(collider)) => {
             if let Some(existing) = state.colliders.get_mut(handle) {
@@ -1220,6 +1859,10 @@ fn sync_entity_collider(
             state.collider_to_entity.remove(&handle);
             state.entity_to_collider.remove(&entity);
             state.collider_owners.remove(&handle);
+            state.compound_part_frictions.remove(&handle);
+            state.ground_materials.remove(&handle);
+            state.ground_lowered_poses.remove(&handle);
+            state.query_pipeline_needs_rebuild = true;
         }
         (None, None) => {}
     }
@@ -1244,22 +1887,103 @@ fn sync_collider_owner(world: &World, state: &mut RapierWorldState, entity: Enti
             state.collider_owners.remove(&handle);
         }
     }
+    refresh_active_hooks(state, handle);
+}
+
+/// Recomputes a collider's Rapier hook flags from every hook-driven feature.
+fn refresh_active_hooks(state: &mut RapierWorldState, handle: ColliderHandle) {
+    let mut active_hooks = if state.collider_owners.contains_key(&handle) {
+        ActiveHooks::FILTER_CONTACT_PAIRS | ActiveHooks::FILTER_INTERSECTION_PAIR
+    } else {
+        ActiveHooks::empty()
+    };
+    if state.compound_part_frictions.contains_key(&handle)
+        || state.ground_materials.contains_key(&handle)
+    {
+        active_hooks |= ActiveHooks::MODIFY_SOLVER_CONTACTS;
+    }
     if let Some(collider) = state.colliders.get_mut(handle) {
-        collider.set_active_hooks(if owner.is_some() {
-            ActiveHooks::FILTER_CONTACT_PAIRS | ActiveHooks::FILTER_INTERSECTION_PAIR
-        } else {
-            ActiveHooks::empty()
-        });
+        collider.set_active_hooks(active_hooks);
         // Setting hooks alone does not invalidate cached Rapier pairs. Reapply
         // the unchanged pose to refresh even stationary/sleeping intersections.
         collider.set_position(*collider.position());
     }
 }
 
+/// Mirrors an entity's [`GroundSurface`] onto its Rapier collider.
+///
+/// The ground material's friction and restitution replace the collider's own
+/// material while the surface is attached; removing the surface restores the
+/// collider's [`Collider`] material.
+fn sync_ground_surface(world: &World, state: &mut RapierWorldState, entity: Entity) {
+    let Some(handle) = state.entity_to_collider.get(&entity).copied() else {
+        return;
+    };
+    let material = world
+        .get::<GroundSurface>(entity)
+        .map(|surface| surface.material)
+        .filter(GroundMaterial::is_valid);
+    if state.ground_materials.get(&handle).copied() == material {
+        return;
+    }
+    let (friction, restitution) = match material {
+        Some(material) => {
+            state.ground_materials.insert(handle, material);
+            (material.friction, material.restitution)
+        }
+        None => {
+            state.ground_materials.remove(&handle);
+            world
+                .get::<Collider>(entity)
+                .map_or((0.5, 0.0), |collider| {
+                    (collider.material.friction, collider.material.restitution)
+                })
+        }
+    };
+    let soil_depth_m = material
+        .and_then(|material| material.deformation)
+        .map_or(0.0, |soil| soil.max_sinkage_m as Real);
+    let original_pose = state.ground_lowered_poses.remove(&handle);
+    if let Some(collider) = state.colliders.get_mut(handle) {
+        collider.set_friction(friction);
+        collider.set_restitution(restitution);
+        // Deformable ground: move the collider down to the firm layer and add
+        // a contact skin of the soil depth, so contacts begin at the authored
+        // surface while shapes sinking into the soil never pass through the
+        // collider geometry (which would lose the contact).
+        if let Some(original) = original_pose {
+            collider.set_position_wrt_parent(original);
+            collider.set_contact_skin(0.0);
+        }
+        if soil_depth_m > 0.0 {
+            if let Some(original) = collider.position_wrt_parent().copied() {
+                let parent_rotation = collider.position().rotation * original.rotation.inverse();
+                let lowered = Isometry::from_parts(
+                    (original.translation.vector
+                        + parent_rotation.inverse_transform_vector(&Vector::new(
+                            0.0,
+                            -soil_depth_m,
+                            0.0,
+                        )))
+                    .into(),
+                    original.rotation,
+                );
+                collider.set_position_wrt_parent(lowered);
+                collider.set_contact_skin(soil_depth_m);
+                state.ground_lowered_poses.insert(handle, original);
+            }
+        }
+    }
+    state.query_pipeline_needs_rebuild = true;
+    refresh_active_hooks(state, handle);
+}
+
 fn remove_stale_owned_colliders(world: &World, state: &mut RapierWorldState) {
     let mut stale: Vec<_> = state
         .collider_owners
         .keys()
+        .chain(state.compound_part_frictions.keys())
+        .chain(state.ground_materials.keys())
         .filter_map(|handle| {
             let entity = state.collider_to_entity.get(handle).copied()?;
             (world.get::<RigidBody>(entity).is_none() || world.get::<Collider>(entity).is_none())
@@ -1267,13 +1991,18 @@ fn remove_stale_owned_colliders(world: &World, state: &mut RapierWorldState) {
         })
         .collect();
     stale.sort_unstable_by_key(|(entity, _)| *entity);
+    stale.dedup();
     for (entity, handle) in stale {
         state
             .colliders
             .remove(handle, &mut state.island_manager, &mut state.bodies, true);
         state.collider_owners.remove(&handle);
+        state.compound_part_frictions.remove(&handle);
+        state.ground_materials.remove(&handle);
+        state.ground_lowered_poses.remove(&handle);
         state.collider_to_entity.remove(&handle);
         state.entity_to_collider.remove(&entity);
+        state.query_pipeline_needs_rebuild = true;
     }
 }
 
@@ -1417,11 +2146,34 @@ fn normalized_axis(axis: Vec3) -> Unit<Vector3<f32>> {
     }
 }
 
-/// Returns all live entities sorted by id for deterministic backend iteration.
-fn sorted_entities(world: &World) -> Vec<Entity> {
-    let mut entities: Vec<Entity> = world.iter_entities().map(|entity| entity.id()).collect();
-    entities.sort_unstable();
-    entities
+/// Refreshes the deterministic entity snapshot shared by an ECS-to-Rapier sync.
+fn refresh_entity_snapshot(world: &World, state: &mut RapierWorldState) {
+    // Every consumer of this snapshot only inspects one of these components.
+    // Selecting their archetypes avoids repeatedly visiting arbitrary scene,
+    // rendering, and gameplay entities during each fixed physics tick. Component
+    // ids and archetypes are inspected afresh because either may change between
+    // synchronizations as components are inserted or removed.
+    let relevant_components = [
+        world.component_id::<RigidBody>(),
+        world.component_id::<RevoluteJointDesc>(),
+        world.component_id::<PrismaticJointDesc>(),
+        world.component_id::<FixedJointDesc>(),
+        world.component_id::<RevoluteJointArmature>(),
+        world.component_id::<JointActuation>(),
+        world.component_id::<JointPassiveDynamics>(),
+    ];
+    state.entity_snapshot.clear();
+    for archetype in world.archetypes().iter().filter(|archetype| {
+        relevant_components
+            .iter()
+            .flatten()
+            .any(|component| archetype.contains(*component))
+    }) {
+        state
+            .entity_snapshot
+            .extend(archetype.entities().iter().map(|entity| entity.id()));
+    }
+    state.entity_snapshot.sort_unstable();
 }
 
 fn sync_joints_from_ecs(world: &World, state: &mut RapierWorldState) -> Result<(), PhysicsError> {
@@ -1452,7 +2204,8 @@ fn sync_joints_from_ecs(world: &World, state: &mut RapierWorldState) -> Result<(
         }
     }
 
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         if state.entity_to_joint.contains_key(&entity)
             || state.entity_to_multibody_joint.contains_key(&entity)
         {
@@ -1556,7 +2309,8 @@ fn sync_attachments_from_ecs(world: &World, state: &mut RapierWorldState) {
             state.impulse_joints.remove(handle, true);
         }
     }
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         if state.entity_to_attachment.contains_key(&entity)
             || !state.entity_to_multibody_joint.contains_key(&entity)
             || !has_articulated_coordinate(world, entity)
@@ -1581,7 +2335,8 @@ fn sync_attachments_from_ecs(world: &World, state: &mut RapierWorldState) {
 }
 
 fn apply_joint_motors(world: &World, state: &mut RapierWorldState) -> Result<(), PhysicsError> {
-    for id in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let id = state.entity_snapshot[index];
         let entity = world.entity(id);
         if let Some(armature) = entity.get::<RevoluteJointArmature>() {
             if !cfg!(feature = "experimental-armature") && armature.inertia_kg_m2 != 0.0 {
@@ -1621,6 +2376,7 @@ fn apply_joint_motors(world: &World, state: &mut RapierWorldState) -> Result<(),
         let Some((multibody, link_id)) = state.multibody_joints.get_mut(*joint_handle) else {
             continue;
         };
+        #[cfg(feature = "experimental-armature")]
         let assembly_id = multibody
             .links()
             .take(link_id)
@@ -1646,6 +2402,12 @@ fn apply_joint_motors(world: &World, state: &mut RapierWorldState) -> Result<(),
             }
         }
         if let Some(damping) = passive_viscous_damping(world, *entity)? {
+            #[cfg(not(feature = "experimental-armature"))]
+            let assembly_id = multibody
+                .links()
+                .take(link_id)
+                .map(|link| link.joint.ndofs())
+                .sum::<usize>();
             multibody.damping_mut()[assembly_id] = damping as f32;
         }
         let Some(link) = multibody.link_mut(link_id) else {
@@ -1779,7 +2541,8 @@ fn apply_direct_joint_efforts(
     world: &World,
     state: &mut RapierWorldState,
 ) -> Result<(), PhysicsError> {
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         let Some(command) = world.get::<JointActuation>(entity).copied() else {
             continue;
         };
@@ -1848,7 +2611,8 @@ fn apply_passive_coulomb_friction(
     world: &World,
     state: &mut RapierWorldState,
 ) -> Result<(), PhysicsError> {
-    for entity in sorted_entities(world) {
+    for index in 0..state.entity_snapshot.len() {
+        let entity = state.entity_snapshot[index];
         let Some(dynamics) = world.get::<JointPassiveDynamics>(entity).copied() else {
             continue;
         };
@@ -1976,9 +2740,9 @@ fn apply_generalized_effort(
                 measured = Some(f64::from((body.user_force() - before).dot(&axis)));
             }
         }
-        if !state.impulse_forced.contains(&handle) {
-            state.impulse_forced.push(handle);
-        }
+        // Clearing a body's force twice is a no-op. Keep append order and avoid
+        // a linear membership scan for every effort applied to a large robot.
+        state.impulse_forced.push(handle);
     }
     measured.ok_or_else(|| invalid_actuation(entity, "dynamic child did not accept joint effort"))
 }
@@ -2076,6 +2840,45 @@ mod tests {
     use rne_ecs::spawn_named;
     use rne_math::Quat;
     use rne_physics::{hash_physics_state, ColliderShape, CollisionGroups};
+
+    #[test]
+    fn contact_stabilization_is_world_local_and_rejects_invalid_updates() {
+        let mut backend = RapierBackend::new();
+        let id = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let other = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        backend
+            .world_mut(id)
+            .unwrap()
+            .integration_parameters
+            .length_unit = 0.1;
+        assert!(backend.set_contact_stabilization(id, 0.00005, 300.0, 10.0));
+        let values = |backend: &RapierBackend| {
+            let p = &backend.world(id).unwrap().integration_parameters;
+            [
+                p.normalized_allowed_linear_error,
+                p.contact_natural_frequency,
+                p.contact_damping_ratio,
+            ]
+        };
+        let expected = values(&backend);
+        assert_relative_eq!(expected[0], 0.0005, epsilon = 1e-9);
+        assert_eq!([expected[1], expected[2]], [300.0, 10.0]);
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e7, f64::MIN_POSITIVE] {
+            assert!(!backend.set_contact_stabilization(id, bad, 300.0, 10.0));
+            assert!(!backend.set_contact_stabilization(id, 0.00005, bad, 10.0));
+            assert!(!backend.set_contact_stabilization(id, 0.00005, 300.0, bad));
+            assert_eq!(values(&backend), expected);
+        }
+        assert!(!backend.set_contact_stabilization(PhysicsWorldId(u32::MAX), 0.00005, 300.0, 10.0));
+        assert_eq!(
+            backend
+                .world(other)
+                .unwrap()
+                .integration_parameters
+                .contact_natural_frequency,
+            30.0
+        );
+    }
 
     fn owner_filter_fixture() -> (RapierBackend, PhysicsWorldId, World) {
         let mut backend = RapierBackend::new();
@@ -2389,7 +3192,9 @@ mod tests {
         for _ in 0..12 {
             step_physics(&mut backend, &mut world, id, fixed_step()).unwrap();
             hashes.push(rne_physics::hash_physics_state_v2(&world));
-            for entity in sorted_entities(&world) {
+            let mut entities: Vec<_> = world.iter_entities().map(|entity| entity.id()).collect();
+            entities.sort_unstable();
+            for entity in entities {
                 let (Some(body), Some(transform)) = (
                     world.get::<RigidBody>(entity),
                     world.get::<Transform3>(entity),
@@ -3002,6 +3807,13 @@ mod tests {
                 assert!(
                     matches!(world.get::<JointEffortMeasurement>(child), Some(JointEffortMeasurement::Revolute { measured_effort_nm }) if *measured_effort_nm == 2.0)
                 );
+                // Without a new sync/command, later completed steps must not
+                // republish the previous effort from either retained buffer.
+                for _ in 0..3 {
+                    backend.step(id, fixed_step()).unwrap();
+                    backend.sync_to_ecs(&mut world, id).unwrap();
+                    assert!(world.get::<JointEffortMeasurement>(child).is_none());
+                }
             }
         }
         let (mut backend, id, mut world, child) = motor_diagnostic_fixture(true, 10.0, 2.0);
@@ -3676,6 +4488,151 @@ mod tests {
         (backend, physics_world, world, ground, cube)
     }
 
+    #[test]
+    fn sync_refreshes_snapshot_after_rejection_slot_reuse_and_joint_lifecycle() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+
+        let parent = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::cuboid(Vec3::splat(0.1)),
+                Transform3::IDENTITY,
+            ))
+            .id();
+        let child = world
+            .spawn((
+                RigidBody::default(),
+                Collider::cuboid(Vec3::splat(0.1)),
+                Transform3::from_translation_rotation(Vec3::Y, Quat::IDENTITY),
+            ))
+            .id();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        world.entity_mut(child).insert(RevoluteJointDesc {
+            parent,
+            axis: Vec3::Z,
+            anchor_parent_m: Vec3::Y,
+            anchor_child_m: Vec3::ZERO,
+            relative_rotation: Quat::IDENTITY,
+            lower_rad: None,
+            upper_rad: None,
+        });
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        assert!(backend
+            .world(physics_world)
+            .unwrap()
+            .entity_to_joint
+            .contains_key(&child));
+
+        world.entity_mut(child).remove::<RevoluteJointDesc>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        assert!(!backend
+            .world(physics_world)
+            .unwrap()
+            .entity_to_joint
+            .contains_key(&child));
+
+        let invalid = world
+            .spawn((
+                RigidBody::default(),
+                Collider::cuboid(Vec3::splat(0.1)),
+                CompoundCollider { parts: Vec::new() },
+                Transform3::IDENTITY,
+            ))
+            .id();
+        assert!(backend.sync_from_ecs(&mut world, physics_world).is_err());
+
+        assert!(world.despawn(invalid));
+        let replacement = world
+            .spawn((
+                RigidBody::default(),
+                Collider::cuboid(Vec3::splat(0.1)),
+                Transform3::from_translation_rotation(Vec3::X, Quat::IDENTITY),
+            ))
+            .id();
+        assert_eq!(replacement.index(), invalid.index());
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        let state = backend.world(physics_world).unwrap();
+        assert!(state.entity_to_body.contains_key(&replacement));
+        assert!(state.entity_snapshot.contains(&replacement));
+        assert!(!state.entity_snapshot.contains(&invalid));
+    }
+
+    #[test]
+    fn filtered_snapshot_tracks_relevant_archetype_additions_and_removals() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+
+        let unrelated = world.spawn_empty().id();
+        let rigid_body = world
+            .spawn((RigidBody::default(), Transform3::IDENTITY))
+            .id();
+        let joint = world.spawn(JointActuation::Disabled).id();
+
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        let snapshot = &backend.world(physics_world).unwrap().entity_snapshot;
+        assert_eq!(snapshot, &vec![rigid_body, joint]);
+        assert!(!snapshot.contains(&unrelated));
+
+        world.entity_mut(unrelated).insert(FixedJointDesc {
+            parent: rigid_body,
+            anchor_parent_m: Vec3::ZERO,
+            anchor_child_m: Vec3::ZERO,
+            relative_rotation: Quat::IDENTITY,
+        });
+        world.entity_mut(rigid_body).remove::<RigidBody>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        let snapshot = &backend.world(physics_world).unwrap().entity_snapshot;
+        assert_eq!(snapshot, &vec![unrelated, joint]);
+    }
+
+    #[test]
+    fn filtered_snapshot_keeps_standalone_control_validation() {
+        let invalid_world = |component: Box<dyn FnOnce(&mut World)>| {
+            let mut backend = RapierBackend::new();
+            let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+            let mut world = World::new();
+            component(&mut world);
+            backend.sync_from_ecs(&mut world, physics_world)
+        };
+
+        assert!(matches!(
+            invalid_world(Box::new(|world| {
+                world.spawn(JointActuation::RevoluteEffort {
+                    effort_nm: 1.0,
+                    max_effort_nm: 1.0,
+                });
+            })),
+            Err(PhysicsError::InvalidActuation { .. })
+        ));
+        assert!(matches!(
+            invalid_world(Box::new(|world| {
+                world.spawn(JointPassiveDynamics::Revolute {
+                    viscous_damping_nm_s_per_rad: 0.0,
+                    coulomb_friction_nm: 1.0,
+                    coulomb_transition_velocity_rad_s: 1.0,
+                });
+            })),
+            Err(PhysicsError::InvalidPassiveDynamics { .. })
+        ));
+        assert!(matches!(
+            invalid_world(Box::new(|world| {
+                world.spawn(RevoluteJointArmature {
+                    inertia_kg_m2: -1.0,
+                });
+            })),
+            Err(PhysicsError::InvalidPassiveDynamics { .. })
+        ));
+    }
+
     /// Drives a motorised foot into a ground surface and reports its rest height.
     ///
     /// The foot is a 22 mm sphere on a prismatic multibody joint whose position
@@ -4025,6 +4982,171 @@ mod tests {
             backend.sync_from_ecs(&mut world, id),
             Err(PhysicsError::InitializationFailed)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep both contact orderings and hook updates in one fixture.
+    fn compound_part_friction_overrides_only_the_selected_child_on_either_contact_side() {
+        for compound_first in [true, false] {
+            let mut backend = RapierBackend::new();
+            let id = backend
+                .create_world(PhysicsWorldDesc {
+                    gravity_m_s2: Vec3::ZERO,
+                    ..PhysicsWorldDesc::default()
+                })
+                .unwrap();
+            let mut world = World::new();
+            let spawn_compound = |world: &mut World| {
+                world
+                    .spawn((
+                        RigidBody::default(),
+                        Collider {
+                            material: rne_physics::PhysicsMaterial {
+                                friction: 0.2,
+                                ..rne_physics::PhysicsMaterial::default()
+                            },
+                            ..Collider::default()
+                        },
+                        CompoundCollider {
+                            parts: vec![
+                                rne_physics::ColliderPart {
+                                    shape: ColliderShape::Sphere { radius_m: 0.5 },
+                                    local_offset: Transform3::from_translation_rotation(
+                                        -Vec3::X,
+                                        Quat::IDENTITY,
+                                    ),
+                                },
+                                rne_physics::ColliderPart {
+                                    shape: ColliderShape::Sphere { radius_m: 0.5 },
+                                    local_offset: Transform3::from_translation_rotation(
+                                        Vec3::X,
+                                        Quat::IDENTITY,
+                                    ),
+                                },
+                            ],
+                        },
+                        Transform3::IDENTITY,
+                    ))
+                    .id()
+            };
+            let spawn_fixed = |world: &mut World, x: f64| {
+                world
+                    .spawn((
+                        RigidBody {
+                            body_type: RigidBodyType::Fixed,
+                            ..RigidBody::default()
+                        },
+                        Collider {
+                            shape: ColliderShape::Sphere { radius_m: 0.5 },
+                            material: rne_physics::PhysicsMaterial {
+                                friction: 0.6,
+                                ..rne_physics::PhysicsMaterial::default()
+                            },
+                            ..Collider::default()
+                        },
+                        Transform3::from_translation_rotation(
+                            Vec3::new(x, 0.0, 0.0),
+                            Quat::IDENTITY,
+                        ),
+                    ))
+                    .id()
+            };
+            let (compound, toe_obstacle, shin_obstacle) = if compound_first {
+                let compound = spawn_compound(&mut world);
+                let toe = spawn_fixed(&mut world, -1.9);
+                let shin = spawn_fixed(&mut world, 1.9);
+                (compound, toe, shin)
+            } else {
+                let toe = spawn_fixed(&mut world, -1.9);
+                let shin = spawn_fixed(&mut world, 1.9);
+                let compound = spawn_compound(&mut world);
+                (compound, toe, shin)
+            };
+
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            let state = backend.world(id).unwrap();
+            let compound_handle = state.entity_to_collider[&compound];
+            let body_handle = state.entity_to_body[&compound];
+            assert!(!backend.set_compound_part_friction(id, compound, 2, 1.0));
+            assert!(!backend.set_compound_part_friction(id, compound, 0, f32::NAN));
+            assert!(!backend.set_compound_part_friction(id, compound, 0, -0.1));
+            assert!(!backend.set_compound_part_friction(
+                PhysicsWorldId(u32::MAX),
+                compound,
+                0,
+                1.0
+            ));
+            assert!(backend.set_compound_part_friction(id, compound, 0, 1.0));
+            let state = backend.world(id).unwrap();
+            assert_eq!(state.entity_to_collider[&compound], compound_handle);
+            assert_eq!(state.entity_to_body[&compound], body_handle);
+            assert_eq!(
+                state.colliders[compound_handle]
+                    .shape()
+                    .as_compound()
+                    .unwrap()
+                    .shapes()
+                    .len(),
+                2
+            );
+            let owner_a = world.spawn_empty().id();
+            let owner_b = world.spawn_empty().id();
+            world
+                .entity_mut(compound)
+                .insert(SelfCollisionExclusion { owner: owner_a });
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            assert!(backend.world(id).unwrap().colliders[compound_handle]
+                .active_hooks()
+                .contains(
+                    ActiveHooks::FILTER_CONTACT_PAIRS
+                        | ActiveHooks::FILTER_INTERSECTION_PAIR
+                        | ActiveHooks::MODIFY_SOLVER_CONTACTS
+                ));
+            world
+                .entity_mut(compound)
+                .insert(SelfCollisionExclusion { owner: owner_b });
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            assert!(backend.world(id).unwrap().colliders[compound_handle]
+                .active_hooks()
+                .contains(ActiveHooks::MODIFY_SOLVER_CONTACTS));
+            world
+                .entity_mut(compound)
+                .remove::<SelfCollisionExclusion>();
+            backend.sync_from_ecs(&mut world, id).unwrap();
+            let active_hooks = backend.world(id).unwrap().colliders[compound_handle].active_hooks();
+            assert!(active_hooks.contains(ActiveHooks::MODIFY_SOLVER_CONTACTS));
+            assert!(!active_hooks.intersects(
+                ActiveHooks::FILTER_CONTACT_PAIRS | ActiveHooks::FILTER_INTERSECTION_PAIR
+            ));
+
+            backend.step(id, fixed_step()).unwrap();
+            let state = backend.world(id).unwrap();
+            let friction_for = |obstacle: Entity| {
+                let obstacle_handle = state.entity_to_collider[&obstacle];
+                let pair = state
+                    .narrow_phase
+                    .contact_pairs()
+                    .find(|pair| {
+                        (pair.collider1 == compound_handle && pair.collider2 == obstacle_handle)
+                            || (pair.collider2 == compound_handle
+                                && pair.collider1 == obstacle_handle)
+                    })
+                    .unwrap();
+                let manifold = pair.manifolds.first().unwrap();
+                let part_index = if pair.collider1 == compound_handle {
+                    manifold.subshape1
+                } else {
+                    manifold.subshape2
+                };
+                let friction = manifold.data.solver_contacts.first().unwrap().friction;
+                (part_index, friction)
+            };
+            let (toe_part, toe_friction) = friction_for(toe_obstacle);
+            let (shin_part, shin_friction) = friction_for(shin_obstacle);
+            assert_eq!((toe_part, shin_part), (0, 1));
+            assert_relative_eq!(toe_friction, 0.8, epsilon = 1e-6);
+            assert_relative_eq!(shin_friction, 0.4, epsilon = 1e-6);
+        }
     }
 
     #[test]
@@ -4482,6 +5604,49 @@ mod tests {
     }
 
     #[test]
+    fn raycast_tracks_dynamic_body_motion_immediately_after_step() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend
+            .create_world(PhysicsWorldDesc {
+                gravity_m_s2: Vec3::ZERO,
+                solver_iterations: 4,
+            })
+            .unwrap();
+        let mut world = World::new();
+        let moving = world
+            .spawn((
+                RigidBody {
+                    linear_velocity_m_s: Vec3::X * 120.0,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.25),
+                Transform3::IDENTITY,
+            ))
+            .id();
+
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        backend.step(physics_world, fixed_step()).unwrap();
+
+        let moved_hits = backend
+            .raycast(
+                physics_world,
+                RaycastQuery::downward(Vec3::new(2.0, 1.0, 0.0), 2.0),
+            )
+            .unwrap();
+        assert_eq!(moved_hits.len(), 1);
+        assert_eq!(moved_hits[0].entity, moving);
+        assert_relative_eq!(moved_hits[0].distance_m, 0.75, epsilon = 1e-5);
+        assert_relative_eq!(moved_hits[0].point_m.y, 0.25, epsilon = 1e-5);
+        assert!(backend
+            .raycast(
+                physics_world,
+                RaycastQuery::downward(Vec3::new(0.0, 1.0, 0.0), 2.0),
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn raycast_is_ready_after_sync_and_returns_all_hits_in_distance_order() {
         let mut backend = RapierBackend::new();
         let physics_world = backend
@@ -4517,6 +5682,140 @@ mod tests {
         assert_eq!(hits[0].entity, near);
         assert_eq!(hits[1].entity, far);
         assert!(hits[0].distance_m < hits[1].distance_m);
+    }
+
+    #[test]
+    fn raycast_is_empty_immediately_after_collider_removal_sync() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+        let body = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                Transform3::from_translation_rotation(Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        world.entity_mut(body).remove::<Collider>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        assert!(backend
+            .raycast(
+                physics_world,
+                RaycastQuery {
+                    origin_m: Vec3::ZERO,
+                    direction: Vec3::X,
+                    max_distance_m: 10.0,
+                },
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn raycast_uses_owned_collider_replacement_after_one_sync() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+        let owner = world.spawn_empty().id();
+        let old = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                SelfCollisionExclusion { owner },
+                Transform3::from_translation_rotation(Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        assert!(world.despawn(old));
+        let replacement = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                Transform3::from_translation_rotation(Vec3::new(6.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+        assert_eq!(replacement.index(), old.index());
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+
+        let hits = backend
+            .raycast(
+                physics_world,
+                RaycastQuery {
+                    origin_m: Vec3::ZERO,
+                    direction: Vec3::X,
+                    max_distance_m: 10.0,
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity, replacement);
+        assert!(hits[0].distance_m > 5.0);
+    }
+
+    #[test]
+    fn failed_sync_keeps_new_collider_query_rebuild_pending() {
+        let mut backend = RapierBackend::new();
+        let physics_world = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+        let added = world
+            .spawn((
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::sphere(0.5),
+                Transform3::from_translation_rotation(Vec3::new(3.0, 0.0, 0.0), Quat::IDENTITY),
+            ))
+            .id();
+        let invalid = world
+            .spawn((
+                RigidBody::default(),
+                Collider::sphere(0.5),
+                CompoundCollider { parts: Vec::new() },
+                Transform3::IDENTITY,
+            ))
+            .id();
+
+        assert!(backend.sync_from_ecs(&mut world, physics_world).is_err());
+        assert!(
+            backend
+                .world(physics_world)
+                .unwrap()
+                .query_pipeline_needs_rebuild
+        );
+
+        world.entity_mut(invalid).remove::<CompoundCollider>();
+        backend.sync_from_ecs(&mut world, physics_world).unwrap();
+        assert!(
+            !backend
+                .world(physics_world)
+                .unwrap()
+                .query_pipeline_needs_rebuild
+        );
+        let hits = backend
+            .raycast(
+                physics_world,
+                RaycastQuery {
+                    origin_m: Vec3::ZERO,
+                    direction: Vec3::X,
+                    max_distance_m: 10.0,
+                },
+            )
+            .unwrap();
+        assert!(hits.iter().any(|hit| hit.entity == added));
     }
 
     #[test]

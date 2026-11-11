@@ -21,6 +21,12 @@ pub enum ViewerError {
     /// Surface or swapchain operation failed.
     #[error("surface error: {0}")]
     Surface(String),
+    /// The live surface cannot be copied to a readback buffer.
+    #[error("surface does not support screenshots")]
+    ScreenshotUnsupported,
+    /// A requested live-frame readback failed.
+    #[error("screenshot readback failed: {0}")]
+    Screenshot(String),
 }
 
 impl From<RenderError> for ViewerError {
@@ -47,6 +53,20 @@ pub struct InteractiveViewer {
     depth_view: wgpu::TextureView,
     overlay: ImageOverlay,
     depth_overlay: DepthOverlay,
+    screenshot_supported: bool,
+    screenshot_requested: bool,
+    screenshot: Option<ViewerScreenshot>,
+}
+
+/// Pixels copied from the actual composited presentation texture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewerScreenshot {
+    /// Tightly packed RGBA8 pixels in presentation order.
+    pub rgba8: Vec<u8>,
+    /// Captured surface width in pixels.
+    pub width: u32,
+    /// Captured surface height in pixels.
+    pub height: u32,
 }
 
 impl InteractiveViewer {
@@ -99,8 +119,19 @@ impl InteractiveViewer {
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(surface_caps.formats[0]);
 
+        let screenshot_supported = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC)
+            && matches!(
+                format,
+                wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Rgba8UnormSrgb
+                    | wgpu::TextureFormat::Bgra8Unorm
+                    | wgpu::TextureFormat::Bgra8UnormSrgb
+            );
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | screenshot_supported
+                    .then_some(wgpu::TextureUsages::COPY_SRC)
+                    .unwrap_or(wgpu::TextureUsages::empty()),
             format,
             width,
             height,
@@ -129,6 +160,9 @@ impl InteractiveViewer {
             depth_view,
             overlay,
             depth_overlay,
+            screenshot_supported,
+            screenshot_requested: false,
+            screenshot: None,
         })
     }
 
@@ -140,6 +174,21 @@ impl InteractiveViewer {
     /// Returns the current drawable size in pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// Requests a one-frame copy of the exact composited swapchain image.
+    /// Readback blocks only while this explicit request is serviced.
+    pub fn request_screenshot(&mut self) -> Result<(), ViewerError> {
+        if !self.screenshot_supported {
+            return Err(ViewerError::ScreenshotUnsupported);
+        }
+        self.screenshot_requested = true;
+        Ok(())
+    }
+
+    /// Takes the most recently requested live-frame capture.
+    pub fn take_screenshot(&mut self) -> Option<ViewerScreenshot> {
+        self.screenshot.take()
     }
 
     /// Replaces the HDR environment used for subsequent frames.
@@ -210,6 +259,113 @@ impl InteractiveViewer {
         pip: Option<(Vec<u8>, u32, u32)>,
     ) -> Result<(), ViewerError> {
         self.render_with_pip_and_depth(view, scene, clear_color, pip, None)
+    }
+
+    /// Renders a scene and composites an optional RGBA8 overlay over the full
+    /// viewport before presenting the frame.
+    pub fn render_with_overlay(
+        &mut self,
+        view: &Transform3,
+        scene: &RenderScene,
+        clear_color: [f32; 4],
+        overlay: Option<(Vec<u8>, u32, u32)>,
+    ) -> Result<(), ViewerError> {
+        let output = self
+            .surface
+            .get_current_texture()
+            .map_err(|error| ViewerError::Surface(error.to_string()))?;
+        let color_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let camera = self.camera();
+        self.primitive
+            .render_to_views(PrimitiveSurfacePass {
+                device: &self.device,
+                queue: &self.queue,
+                camera: &camera,
+                view,
+                scene,
+                environment: &self.environment,
+                clear_color,
+                preserve_color: false,
+                targets: &PrimitiveRenderViews {
+                    width: self.config.width,
+                    height: self.config.height,
+                    color_view: &color_view,
+                    depth_view: &self.depth_view,
+                },
+            })
+            .map_err(ViewerError::from)?;
+        if let Some((rgba8, width, height)) = overlay {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rne_viewer_overlay_encoder"),
+                });
+            self.overlay.draw(
+                &self.device,
+                &self.queue,
+                ImageOverlayDraw {
+                    encoder: &mut encoder,
+                    color_view: &color_view,
+                    rgba8: &rgba8,
+                    width,
+                    height,
+                    ndc_min: [-1.0, -1.0],
+                    ndc_max: [1.0, 1.0],
+                },
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+        self.capture_requested_frame(&output.texture)?;
+        output.present();
+        Ok(())
+    }
+
+    /// Returns the graphics resources for a UI renderer sharing this surface.
+    pub fn graphics_context(&self) -> (&wgpu::Device, &wgpu::Queue, wgpu::TextureFormat) {
+        (&self.device, &self.queue, self.config.format)
+    }
+
+    /// Renders a scene, then runs a GPU overlay pass before capture and present.
+    /// The overlay must preserve the scene color. Captures include the overlay.
+    pub fn render_with_gui(
+        &mut self,
+        view: &Transform3,
+        scene: &RenderScene,
+        clear_color: [f32; 4],
+        draw: impl FnOnce(&wgpu::Device, &wgpu::Queue, &wgpu::TextureView),
+    ) -> Result<(), ViewerError> {
+        let output = self
+            .surface
+            .get_current_texture()
+            .map_err(|error| ViewerError::Surface(error.to_string()))?;
+        let color_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let camera = self.camera();
+        self.primitive
+            .render_to_views(PrimitiveSurfacePass {
+                device: &self.device,
+                queue: &self.queue,
+                camera: &camera,
+                view,
+                scene,
+                environment: &self.environment,
+                clear_color,
+                preserve_color: false,
+                targets: &PrimitiveRenderViews {
+                    width: self.config.width,
+                    height: self.config.height,
+                    color_view: &color_view,
+                    depth_view: &self.depth_view,
+                },
+            })
+            .map_err(ViewerError::from)?;
+        draw(&self.device, &self.queue, &color_view);
+        self.capture_requested_frame(&output.texture)?;
+        output.present();
+        Ok(())
     }
 
     /// Renders a scene with optional RGBA8 and GPU depth PiP overlays.
@@ -325,6 +481,101 @@ impl InteractiveViewer {
     }
 }
 
+impl InteractiveViewer {
+    fn capture_requested_frame(&mut self, texture: &wgpu::Texture) -> Result<(), ViewerError> {
+        if !self.screenshot_requested {
+            return Ok(());
+        }
+        self.screenshot_requested = false;
+        let width = self.config.width;
+        let height = self.config.height;
+        let packed_row = width
+            .checked_mul(4)
+            .ok_or_else(|| ViewerError::Screenshot("row size overflow".into()))?;
+        let bytes_per_row = align_to(packed_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer_size = u64::from(bytes_per_row)
+            .checked_mul(u64::from(height))
+            .ok_or_else(|| ViewerError::Screenshot("buffer size overflow".into()))?;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rne_viewer_screenshot_readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rne_viewer_screenshot_encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|_| ViewerError::Screenshot("readback channel closed".into()))?
+            .map_err(|error| ViewerError::Screenshot(error.to_string()))?;
+        let mapped = slice.get_mapped_range();
+        let mut rgba8 = copy_padded_rgba8(&mapped, width, height, bytes_per_row);
+        drop(mapped);
+        buffer.unmap();
+        if matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for pixel in rgba8.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        self.screenshot = Some(ViewerScreenshot {
+            rgba8,
+            width,
+            height,
+        });
+        Ok(())
+    }
+}
+
+fn align_to(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
+
+fn copy_padded_rgba8(bytes: &[u8], width: u32, height: u32, bytes_per_row: u32) -> Vec<u8> {
+    let packed_row = width as usize * 4;
+    let mut rgba8 = vec![0; packed_row * height as usize];
+    for row in 0..height as usize {
+        let source = row * bytes_per_row as usize;
+        let destination = row * packed_row;
+        rgba8[destination..destination + packed_row]
+            .copy_from_slice(&bytes[source..source + packed_row]);
+    }
+    rgba8
+}
+
 fn create_depth_target(
     device: &wgpu::Device,
     width: u32,
@@ -350,6 +601,7 @@ fn create_depth_target(
 
 #[cfg(test)]
 mod tests {
+    use super::copy_padded_rgba8;
     use crate::camera::CameraOrbit;
     use rne_math::Vec3;
 
@@ -365,5 +617,16 @@ mod tests {
         assert!(transform.translation.x.is_finite());
         assert!(transform.translation.y.is_finite());
         assert!(transform.translation.z.is_finite());
+    }
+
+    #[test]
+    fn screenshot_rows_strip_wgpu_padding() {
+        let source = [
+            1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99, 9, 10, 11, 12, 13, 14, 15, 16, 99, 99, 99, 99,
+        ];
+        assert_eq!(
+            copy_padded_rgba8(&source, 2, 2, 12),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
     }
 }

@@ -162,6 +162,8 @@ pub(crate) struct TwoBodyConstraintNormalPart<N: SimdRealCopy> {
     pub rhs_wo_bias: N,
     pub impulse: N,
     pub impulse_accumulator: N,
+    /// RNE patch: per-substep upper bound of `impulse`.
+    pub max_impulse: N,
     pub r: N,
     // For coupled constraint pairs, even constraints store the
     // diagonal of the projected mass matrix. Odd constraints
@@ -179,6 +181,7 @@ impl<N: SimdRealCopy> TwoBodyConstraintNormalPart<N> {
             rhs_wo_bias: na::zero(),
             impulse: na::zero(),
             impulse_accumulator: na::zero(),
+            max_impulse: N::splat(crate::math::Real::MAX),
             r: na::zero(),
             r_mat_elts: [N::zero(); 2],
         }
@@ -222,7 +225,9 @@ impl<N: SimdRealCopy> TwoBodyConstraintNormalPart<N> {
             - dir1.dot(&solver_vel2.linear)
             + self.gcross2.gdot(solver_vel2.angular)
             + self.rhs;
-        let new_impulse = cfm_factor * (self.impulse - self.r * dvel).simd_max(N::zero());
+        let new_impulse = cfm_factor * (self.impulse - self.r * dvel)
+            .simd_max(N::zero())
+            .simd_min(self.max_impulse);
         let dlambda = new_impulse - self.impulse;
         self.impulse = new_impulse;
 
