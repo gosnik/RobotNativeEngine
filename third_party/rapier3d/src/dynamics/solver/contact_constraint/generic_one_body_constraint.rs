@@ -162,6 +162,7 @@ impl GenericOneBodyConstraintBuilder {
                         rhs_wo_bias: na::zero(),
                         impulse: na::zero(),
                         impulse_accumulator: na::zero(),
+                        max_impulse: na::zero(), // RNE patch: set by `update`.
                         r,
                         r_mat_elts: [0.0; 2],
                     };
@@ -216,6 +217,7 @@ impl GenericOneBodyConstraintBuilder {
                     tangent_vel: manifold_point.tangent_velocity,
                     dist: manifold_point.dist,
                     normal_rhs_wo_bias,
+                    max_normal_force: manifold_point.max_normal_force,
                 };
 
                 builder.link2 = link2;

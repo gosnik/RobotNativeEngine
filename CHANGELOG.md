@@ -4,6 +4,16 @@ All notable changes to Robot Native Engine are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Selectable ground types (`GroundSurface`, `GroundType::{Normal, Rock, Sand,
+  Mud}`, `GroundMaterial`, `SoilDeformation`) in `rne_physics`. The Rapier
+  backend makes sand and mud yield under load (Bekker pressure-sinkage with a
+  viscous term, plastic displacement, creep for mud, a firm layer), applies
+  per-ground friction and restitution, and reports `GroundContactSample`s via
+  `RapierBackend::ground_contacts`. The vendored Rapier solver gains a
+  per-contact `max_normal_force`. See `docs/GROUND_TYPES.md`.
+
 ### Fixed
 
 - Accept `.` and `..` as installed bundle roots in the source-free flagship

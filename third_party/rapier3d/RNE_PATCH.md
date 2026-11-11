@@ -147,3 +147,17 @@ replay and constructor/coordinate arithmetic checks. A separate unchanged
 72-world source-transition run retains scalar calibration FAIL 0/4. These results
 do not establish full private-state equality, motor accuracy, convergence or
 production readiness; the inverse-diagonal candidate remains rejected.
+
+## Per-contact normal force bound
+
+`SolverContact::max_normal_force` (default `Real::MAX`) bounds a contact's
+normal force. Physics hooks may lower it in `modify_solver_contacts`; the
+contact constraint builders carry it in `ContactPointInfos`, convert it to a
+per-substep impulse bound when the constraint is updated, clamp the warmstart
+impulse to it, and clamp every normal-impulse solve (scalar, SIMD and generic
+multibody paths). Friction remains bounded by the clamped normal impulse. The
+3D block solver is disabled upstream, so `solve_pair` is unchanged. With the
+default value the arithmetic only adds a `min` against `Real::MAX`, so rigid
+contacts are unchanged. `SolverContact::contact_id()` exposes the manifold
+point index of a solver contact. RNE uses both for deformable ground
+(`docs/GROUND_TYPES.md`).

@@ -1,0 +1,401 @@
+//! Rapier regressions for selectable ground types (normal, rock, sand, mud).
+
+use rne_core::SimDuration;
+use rne_ecs::{Entity, World};
+use rne_math::Vec3;
+use rne_physics::{
+    Collider, GroundMaterial, GroundSurface, GroundType, PhysicsBackend, PhysicsWorldDesc,
+    PhysicsWorldId, RigidBody, RigidBodyType,
+};
+use rne_physics_rapier::RapierBackend;
+use rne_world::Transform3;
+
+const DT_NS: u64 = 1_000_000;
+const TOE_RADIUS_M: f64 = 0.015;
+const TOE_MASS_KG: f64 = 1.5;
+
+struct Scene {
+    backend: RapierBackend,
+    world: World,
+    world_id: PhysicsWorldId,
+    ground: Entity,
+    body: Entity,
+}
+
+impl Scene {
+    fn new(ground: Option<GroundType>, body: (Collider, f64, Vec3, Vec3)) -> Self {
+        let mut backend = RapierBackend::new();
+        let world_id = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+        let mut world = World::new();
+        let ground_entity = world
+            .spawn((
+                Transform3::from_translation_rotation(
+                    Vec3::new(0.0, -0.5, 0.0),
+                    rne_math::Quat::IDENTITY,
+                ),
+                RigidBody {
+                    body_type: RigidBodyType::Fixed,
+                    ..RigidBody::default()
+                },
+                Collider::cuboid(Vec3::new(5.0, 0.5, 5.0)),
+            ))
+            .id();
+        if let Some(kind) = ground {
+            world
+                .entity_mut(ground_entity)
+                .insert(GroundSurface::new(kind));
+        }
+        let (collider, mass_kg, position, velocity) = body;
+        let body = world
+            .spawn((
+                Transform3::from_translation_rotation(position, rne_math::Quat::IDENTITY),
+                RigidBody {
+                    mass_kg,
+                    linear_velocity_m_s: velocity,
+                    ..RigidBody::default()
+                },
+                collider,
+            ))
+            .id();
+        Self {
+            backend,
+            world,
+            world_id,
+            ground: ground_entity,
+            body,
+        }
+    }
+
+    fn toe(ground: Option<GroundType>, drop_speed_m_s: f64) -> Self {
+        Self::new(
+            ground,
+            (
+                Collider::sphere(TOE_RADIUS_M),
+                TOE_MASS_KG,
+                Vec3::new(0.0, TOE_RADIUS_M + 0.002, 0.0),
+                Vec3::new(0.0, -drop_speed_m_s, 0.0),
+            ),
+        )
+    }
+
+    fn step(&mut self) {
+        self.backend
+            .sync_from_ecs(&mut self.world, self.world_id)
+            .unwrap();
+        self.backend
+            .step(self.world_id, SimDuration::from_ticks(DT_NS))
+            .unwrap();
+        self.backend
+            .sync_to_ecs(&mut self.world, self.world_id)
+            .unwrap();
+    }
+
+    fn position(&self) -> Vec3 {
+        self.world.get::<Transform3>(self.body).unwrap().translation
+    }
+
+    fn ground_force_n(&self) -> f64 {
+        self.backend
+            .ground_contacts(self.world_id)
+            .unwrap()
+            .iter()
+            .map(|contact| contact.normal_force_n)
+            .sum()
+    }
+}
+
+struct DropTrace {
+    peak_force_n: f64,
+    sinkage_at_m: Vec<f64>,
+}
+
+/// Drops the toe at 0.5 m/s and records peak force and sinkage over time.
+fn drop_toe(ground: Option<GroundType>, steps: usize) -> DropTrace {
+    drop_toe_at(ground, 0.5, steps)
+}
+
+fn drop_toe_at(ground: Option<GroundType>, speed_m_s: f64, steps: usize) -> DropTrace {
+    let mut scene = Scene::toe(ground, speed_m_s);
+    let mut peak_force_n: f64 = 0.0;
+    let mut sinkage_at_m = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        scene.step();
+        peak_force_n = peak_force_n.max(scene.ground_force_n());
+        sinkage_at_m.push((TOE_RADIUS_M - scene.position().y).max(0.0));
+    }
+    DropTrace {
+        peak_force_n,
+        sinkage_at_m,
+    }
+}
+
+fn weight_n() -> f64 {
+    TOE_MASS_KG * 9.81
+}
+
+#[test]
+fn ground_type_names_round_trip() {
+    for kind in GroundType::ALL {
+        assert_eq!(GroundType::from_name(kind.name()), Some(kind));
+        assert!(GroundMaterial::preset(kind).is_valid());
+    }
+    assert_eq!(GroundType::from_name("lava"), None);
+}
+
+#[test]
+fn rigid_ground_supports_the_toe_at_the_surface() {
+    for kind in [GroundType::Normal, GroundType::Rock] {
+        let trace = drop_toe(Some(kind), 800);
+        let settled = *trace.sinkage_at_m.last().unwrap();
+        assert!(settled < 0.002, "{kind:?} sank {settled} m");
+    }
+}
+
+#[test]
+fn normal_ground_matches_a_plain_collider() {
+    let mut plain = Scene::toe(None, 0.5);
+    let mut normal = Scene::toe(Some(GroundType::Normal), 0.5);
+    for _ in 0..300 {
+        plain.step();
+        normal.step();
+        assert_eq!(plain.position(), normal.position());
+    }
+}
+
+#[test]
+fn sand_yields_until_it_bears_the_load_and_then_holds() {
+    let soil = GroundMaterial::preset(GroundType::Sand)
+        .deformation
+        .unwrap();
+    let pad_m = TOE_RADIUS_M.max(soil.min_contact_radius_m);
+    let equilibrium_m = soil.equilibrium_sinkage_m(weight_n(), pad_m);
+    // Released from rest on the surface: plastic ground cannot spring back,
+    // so the toe overshoots the static equilibrium, then stays put.
+    let trace = drop_toe_at(Some(GroundType::Sand), 0.0, 1500);
+    let settled = *trace.sinkage_at_m.last().unwrap();
+    assert!(
+        settled > equilibrium_m && settled < 2.5 * equilibrium_m,
+        "settled {settled} m, Bekker equilibrium {equilibrium_m} m"
+    );
+    assert!(soil.static_bearing_n(settled, pad_m) > weight_n());
+    // Sand does not creep: the last half second moves less than a millimetre
+    // (Rapier's penetration slop).
+    let half_way = trace.sinkage_at_m[1000];
+    assert!(settled - half_way < 1.0e-3, "{half_way} -> {settled}");
+}
+
+#[test]
+fn faster_touchdown_sinks_deeper_into_sand() {
+    let gentle = *drop_toe_at(Some(GroundType::Sand), 0.0, 800)
+        .sinkage_at_m
+        .last()
+        .unwrap();
+    let fast = *drop_toe_at(Some(GroundType::Sand), 0.5, 800)
+        .sinkage_at_m
+        .last()
+        .unwrap();
+    assert!(fast > gentle + 0.002, "gentle {gentle} m, fast {fast} m");
+}
+
+#[test]
+fn mud_keeps_creeping_under_sustained_load() {
+    let trace = drop_toe(Some(GroundType::Mud), 1500);
+    let early = trace.sinkage_at_m[300];
+    let late = *trace.sinkage_at_m.last().unwrap();
+    assert!(early > 0.002, "mud should sink on impact: {early}");
+    assert!(late > early + 0.01, "mud should creep: {early} -> {late}");
+    // Creep is smooth: consecutive steps never jump by more than 0.2 mm.
+    for pair in trace.sinkage_at_m[300..].windows(2) {
+        assert!((pair[1] - pair[0]).abs() < 2.0e-4, "{pair:?}");
+    }
+}
+
+#[test]
+fn soft_ground_softens_the_impact() {
+    let rock = drop_toe(Some(GroundType::Rock), 200).peak_force_n;
+    let normal = drop_toe(Some(GroundType::Normal), 200).peak_force_n;
+    let sand = drop_toe(Some(GroundType::Sand), 200).peak_force_n;
+    let mud = drop_toe(Some(GroundType::Mud), 200).peak_force_n;
+    // A rigid stop of 0.5 m/s in one 1 ms step is ~50 times body weight.
+    assert!(rock > 10.0 * weight_n() && normal > 10.0 * weight_n());
+    assert!(sand < 0.5 * normal, "sand {sand} N vs normal {normal} N");
+    assert!(mud < 0.5 * normal, "mud {mud} N vs normal {normal} N");
+}
+
+/// Slides a block at 1 m/s and returns how far it travels in one second.
+fn slide_distance_m(ground: GroundType) -> f64 {
+    let half = Vec3::new(0.05, 0.02, 0.05);
+    let mut scene = Scene::new(
+        Some(ground),
+        (
+            Collider::cuboid(half),
+            1.0,
+            Vec3::new(0.0, half.y, 0.0),
+            Vec3::ZERO,
+        ),
+    );
+    // Let the block settle (and sink into soft ground) before it slides.
+    for _ in 0..500 {
+        scene.step();
+    }
+    let start = scene.position();
+    scene
+        .world
+        .get_mut::<RigidBody>(scene.body)
+        .unwrap()
+        .linear_velocity_m_s = Vec3::new(1.0, 0.0, 0.0);
+    for _ in 0..1000 {
+        scene.step();
+    }
+    scene.position().x - start.x
+}
+
+#[test]
+fn friction_orders_rock_normal_sand_mud() {
+    let rock = slide_distance_m(GroundType::Rock);
+    let normal = slide_distance_m(GroundType::Normal);
+    let mud = slide_distance_m(GroundType::Mud);
+    assert!(rock < normal, "rock {rock} m, normal {normal} m");
+    assert!(normal < mud, "normal {normal} m, mud {mud} m");
+}
+
+#[test]
+fn ground_contacts_report_type_sinkage_and_force() {
+    let mut scene = Scene::toe(Some(GroundType::Sand), 0.0);
+    for _ in 0..1000 {
+        scene.step();
+    }
+    let contacts = scene.backend.ground_contacts(scene.world_id).unwrap();
+    assert!(!contacts.is_empty());
+    let contact = contacts[0];
+    assert_eq!(contact.ground_type, GroundType::Sand);
+    assert_eq!(contact.entity, scene.body);
+    assert_eq!(contact.ground_entity, scene.ground);
+    assert!(contact.sinkage_m > 0.002);
+    assert!(contact.ground_normal_world.y > 0.99);
+    let total: f64 = contacts.iter().map(|c| c.normal_force_n).sum();
+    // Same force convention as resting on rigid ground.
+    let mut rigid = Scene::toe(Some(GroundType::Normal), 0.0);
+    for _ in 0..1000 {
+        rigid.step();
+    }
+    let rigid_total = rigid.ground_force_n();
+    assert!(
+        (total - rigid_total).abs() < 0.02 * rigid_total,
+        "{total} N on sand vs {rigid_total} N on rigid ground"
+    );
+    assert!(contact.bearing_capacity_n.is_finite());
+    assert!(contact.bearing_capacity_n >= contact.normal_force_n * 0.95);
+    assert!(!contact.yielding);
+    let rigid_contact = rigid.backend.ground_contacts(rigid.world_id).unwrap()[0];
+    assert_eq!(rigid_contact.ground_type, GroundType::Normal);
+    assert!(rigid_contact.bearing_capacity_n.is_infinite());
+}
+
+#[test]
+fn removing_the_surface_restores_rigid_ground() {
+    let mut scene = Scene::toe(Some(GroundType::Sand), 0.0);
+    for _ in 0..200 {
+        scene.step();
+    }
+    let sunk_m = TOE_RADIUS_M - scene.position().y;
+    assert!(sunk_m > 0.02, "{sunk_m}");
+    scene
+        .world
+        .entity_mut(scene.ground)
+        .remove::<GroundSurface>();
+    scene.step();
+    assert!(scene
+        .backend
+        .ground_contacts(scene.world_id)
+        .unwrap()
+        .is_empty());
+    // The displaced sand is gone; rigid ground pushes the toe back out.
+    for _ in 0..1000 {
+        scene.step();
+    }
+    let depth_m = TOE_RADIUS_M - scene.position().y;
+    assert!(depth_m < 0.005, "toe still {depth_m} m deep");
+}
+
+#[test]
+fn articulated_toe_sinks_like_a_free_body() {
+    // Robot feet are multibody links, which use Rapier's generic contact path.
+    let mut free = Scene::toe(Some(GroundType::Sand), 0.0);
+    let mut articulated = Scene::toe(Some(GroundType::Sand), 0.0);
+    articulated
+        .world
+        .entity_mut(articulated.body)
+        .insert(rne_physics::MultibodyLink);
+    for _ in 0..800 {
+        free.step();
+        articulated.step();
+    }
+    let free_m = TOE_RADIUS_M - free.position().y;
+    let articulated_m = TOE_RADIUS_M - articulated.position().y;
+    assert!(free_m > 0.015, "{free_m}");
+    assert!(
+        (articulated_m - free_m).abs() < 0.2 * free_m,
+        "articulated {articulated_m} m vs free {free_m} m"
+    );
+}
+
+#[test]
+fn toe_sinks_into_a_height_field_without_falling_through() {
+    let mut scene = Scene::toe(Some(GroundType::Mud), 0.0);
+    let flat = rne_physics::ColliderShape::HeightField {
+        nrows: 11,
+        ncols: 11,
+        heights_m: vec![0.0; 121].into(),
+        scale: Vec3::new(2.0, 1.0, 2.0),
+    };
+    scene.world.entity_mut(scene.ground).insert((
+        Transform3::from_translation_rotation(Vec3::ZERO, rne_math::Quat::IDENTITY),
+        Collider {
+            shape: flat,
+            ..Collider::default()
+        },
+    ));
+    // Rest the toe over a triangle diagonal, where several faces touch it.
+    scene
+        .world
+        .get_mut::<Transform3>(scene.body)
+        .unwrap()
+        .translation = Vec3::new(0.03, TOE_RADIUS_M, 0.04);
+    let mut previous = 0.0;
+    for step in 0..2000 {
+        scene.step();
+        let sinkage = TOE_RADIUS_M - scene.position().y;
+        assert!(sinkage < 0.13, "fell through at step {step}: {sinkage} m");
+        assert!(sinkage - previous < 2.0e-3, "jump at step {step}");
+        previous = sinkage;
+    }
+    // Mud creeps down to the firm layer and stops there.
+    let max_sinkage = GroundMaterial::preset(GroundType::Mud)
+        .deformation
+        .unwrap()
+        .max_sinkage_m;
+    assert!(
+        previous > 0.03 && previous < max_sinkage + 0.003,
+        "{previous}"
+    );
+}
+
+#[test]
+fn raycasts_hit_the_undisturbed_soil_surface() {
+    let mut scene = Scene::toe(Some(GroundType::Sand), 0.0);
+    scene.step();
+    let hits = scene
+        .backend
+        .raycast(
+            scene.world_id,
+            rne_physics::RaycastQuery::downward(Vec3::new(1.0, 1.0, 1.0), 5.0),
+        )
+        .unwrap();
+    let ground_hit = hits.iter().find(|hit| hit.entity == scene.ground).unwrap();
+    assert!(
+        ground_hit.point_m.y.abs() < 1.0e-4,
+        "{:?}",
+        ground_hit.point_m
+    );
+}

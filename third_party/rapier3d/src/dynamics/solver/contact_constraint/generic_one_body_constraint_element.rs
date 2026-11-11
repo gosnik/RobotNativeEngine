@@ -136,7 +136,8 @@ impl OneBodyConstraintNormalPart<Real> {
             .dot(&solver_vels.rows(solver_vel2, ndofs2))
             + self.rhs;
 
-        let new_impulse = cfm_factor * (self.impulse - self.r * dvel).max(0.0);
+        let new_impulse =
+            cfm_factor * (self.impulse - self.r * dvel).max(0.0).min(self.max_impulse);
         let dlambda = new_impulse - self.impulse;
         self.impulse = new_impulse;
 

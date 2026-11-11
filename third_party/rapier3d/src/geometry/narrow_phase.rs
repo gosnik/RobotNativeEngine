@@ -1010,6 +1010,7 @@ impl NarrowPhase {
                                 is_new: contact.data.impulse == 0.0,
                                 warmstart_impulse: contact.data.warmstart_impulse,
                                 warmstart_tangent_impulse: contact.data.warmstart_tangent_impulse,
+                                max_normal_force: Real::MAX,
                             };
 
                             manifold.data.solver_contacts.push(solver_contact);
