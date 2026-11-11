@@ -390,7 +390,8 @@ impl TwoBodyConstraintNormalPart<Real> {
             + solver_vel2.dvel(j_id2, ndofs2, jacobians, &-dir1, &self.gcross2, solver_vels)
             + self.rhs;
 
-        let new_impulse = cfm_factor * (self.impulse - self.r * dvel).max(0.0);
+        let new_impulse =
+            cfm_factor * (self.impulse - self.r * dvel).max(0.0).min(self.max_impulse);
         let dlambda = new_impulse - self.impulse;
         self.impulse = new_impulse;
 

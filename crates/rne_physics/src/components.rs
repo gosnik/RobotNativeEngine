@@ -8,6 +8,8 @@ use rne_math::{Quat, Vec3};
 use rne_world::Transform3;
 use serde::{Deserialize, Serialize};
 
+use crate::ground_map::GroundTypeMap;
+
 /// Rigid body motion type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RigidBodyType {
@@ -1451,5 +1453,416 @@ mod tests {
             max_force_n: 10.0,
         }
         .has_valid_values());
+    }
+}
+
+/// Kind of ground a terrain collider represents.
+///
+/// Each kind has a [`GroundMaterial::preset`] with nominal contact behaviour.
+/// The presets are simulation assumptions chosen from textbook terramechanics
+/// values, not measurements of a particular site.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GroundType {
+    /// Rigid, moderately grippy ground (packed earth, concrete). Matches the
+    /// behaviour of a plain [`Collider`] with the default [`PhysicsMaterial`].
+    #[default]
+    Normal,
+    /// Rigid, high-friction rock with a small rebound on impact.
+    Rock,
+    /// Loose dry sand: yields plastically under load, little rate dependence,
+    /// friction limited by the sand's internal friction angle.
+    Sand,
+    /// Wet cohesive mud: yields under load, strongly rate dependent (viscous),
+    /// keeps creeping under sustained load, and is slippery.
+    Mud,
+}
+
+impl GroundType {
+    /// All ground kinds, in declaration order.
+    pub const ALL: [GroundType; 4] = [
+        GroundType::Normal,
+        GroundType::Rock,
+        GroundType::Sand,
+        GroundType::Mud,
+    ];
+
+    /// Stable lowercase name, suitable for command-line flags and logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            GroundType::Normal => "normal",
+            GroundType::Rock => "rock",
+            GroundType::Sand => "sand",
+            GroundType::Mud => "mud",
+        }
+    }
+
+    /// Parses a name produced by [`Self::name`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+}
+
+/// Pressure-sinkage and yield model for deformable ground.
+///
+/// The ground supports a contact patch until the normal force reaches the
+/// bearing capacity at the current sinkage `z`, then yields plastically:
+///
+/// ```text
+/// p(z)   = (k_c / b + k_phi) · z^n                (Bekker pressure-sinkage)
+/// F_cap  = A(z) · (p(z) + c · v_sink)             (plus viscous resistance)
+/// ```
+///
+/// `b` is the contact patch radius (the touching ball, capsule or cylinder
+/// radius, at least [`Self::min_contact_radius_m`]) and `A(z)` the patch area of a sphere of that
+/// radius pressed to depth `z` (`π(2bz − z²)`, then `πb²` once `z ≥ b`). There is
+/// no elastic rebound: ground displaced by a contact stays displaced while the
+/// contact persists. Beyond [`Self::max_sinkage_m`] a firm layer supports any
+/// load. Under sustained load the ground additionally creeps at up to
+/// [`Self::creep_velocity_m_s`], scaled by how close the load is to the static
+/// bearing capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SoilDeformation {
+    /// Bekker cohesive modulus `k_c`, in N/m^(n+1).
+    pub cohesive_modulus_n_per_m_n1: f64,
+    /// Bekker frictional modulus `k_phi`, in N/m^(n+2).
+    pub frictional_modulus_n_per_m_n2: f64,
+    /// Bekker sinkage exponent `n` (dimensionless, positive).
+    pub sinkage_exponent: f64,
+    /// Viscous resistance `c`: extra pressure per sinking speed, in Pa·s/m.
+    pub viscous_damping_pa_s_per_m: f64,
+    /// Creep speed under a load equal to the static bearing capacity, in m/s.
+    pub creep_velocity_m_s: f64,
+    /// Depth of the firm layer below the surface, in meters.
+    pub max_sinkage_m: f64,
+    /// Smallest contact patch radius, in meters. Used for shapes that are not
+    /// rounded (boxes, meshes), and as a lower bound for rounded ones so that
+    /// a small collision proxy (e.g. a 2 mm toe sphere) bears load like the
+    /// foot pad it stands in for.
+    pub min_contact_radius_m: f64,
+    /// Extra friction from bulldozing displaced ground, added per unit of
+    /// sinkage relative to the contact radius (saturating at one radius).
+    pub bulldozing_friction_gain: f64,
+}
+
+impl SoilDeformation {
+    /// Contact patch area, in square meters, at `sinkage_m` for a rounded
+    /// contact of radius `radius_m`.
+    pub fn contact_area_m2(sinkage_m: f64, radius_m: f64) -> f64 {
+        if !(sinkage_m > 0.0 && radius_m > 0.0) {
+            return 0.0;
+        }
+        let z = sinkage_m.min(radius_m);
+        std::f64::consts::PI * (2.0 * radius_m * z - z * z)
+    }
+
+    /// Static bearing pressure at `sinkage_m`, in pascals.
+    pub fn pressure_pa(&self, sinkage_m: f64, radius_m: f64) -> f64 {
+        if !(sinkage_m > 0.0 && radius_m > 0.0) {
+            return 0.0;
+        }
+        (self.cohesive_modulus_n_per_m_n1 / radius_m + self.frictional_modulus_n_per_m_n2)
+            * sinkage_m.powf(self.sinkage_exponent)
+    }
+
+    /// Static load, in newtons, the ground carries at `sinkage_m` before yielding.
+    ///
+    /// Returns infinity at or beyond [`Self::max_sinkage_m`].
+    pub fn static_bearing_n(&self, sinkage_m: f64, radius_m: f64) -> f64 {
+        if sinkage_m >= self.max_sinkage_m {
+            return f64::INFINITY;
+        }
+        Self::contact_area_m2(sinkage_m, radius_m) * self.pressure_pa(sinkage_m, radius_m)
+    }
+
+    /// Load, in newtons, the ground carries at `sinkage_m` while the contact
+    /// sinks at `sink_velocity_m_s` (negative values are treated as zero).
+    pub fn bearing_capacity_n(&self, sinkage_m: f64, radius_m: f64, sink_velocity_m_s: f64) -> f64 {
+        let static_n = self.static_bearing_n(sinkage_m, radius_m);
+        static_n
+            + Self::contact_area_m2(sinkage_m, radius_m)
+                * self.viscous_damping_pa_s_per_m
+                * sink_velocity_m_s.max(0.0)
+    }
+
+    /// Sinkage, in meters, at which a static `load_n` is carried.
+    ///
+    /// Solves `static_bearing_n(z) = load_n` by bisection; returns
+    /// [`Self::max_sinkage_m`] when the firm layer is reached first.
+    pub fn equilibrium_sinkage_m(&self, load_n: f64, radius_m: f64) -> f64 {
+        if load_n.is_nan() || load_n <= 0.0 {
+            return 0.0;
+        }
+        let (mut low, mut high) = (0.0, self.max_sinkage_m);
+        for _ in 0..64 {
+            let mid = 0.5 * (low + high);
+            if self.static_bearing_n(mid, radius_m) < load_n {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        high
+    }
+
+    /// Friction gain from bulldozing at `sinkage_m` for a contact of `radius_m`.
+    pub fn bulldozing_friction(&self, sinkage_m: f64, radius_m: f64) -> f64 {
+        if !(sinkage_m > 0.0 && radius_m > 0.0) {
+            return 0.0;
+        }
+        self.bulldozing_friction_gain * (sinkage_m / radius_m).min(1.0)
+    }
+
+    fn is_valid(&self) -> bool {
+        let values = [
+            self.cohesive_modulus_n_per_m_n1,
+            self.frictional_modulus_n_per_m_n2,
+            self.sinkage_exponent,
+            self.viscous_damping_pa_s_per_m,
+            self.creep_velocity_m_s,
+            self.max_sinkage_m,
+            self.min_contact_radius_m,
+            self.bulldozing_friction_gain,
+        ];
+        values
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+            && self.sinkage_exponent > 0.0
+            && self.max_sinkage_m > 0.0
+            && self.min_contact_radius_m > 0.0
+            && self.cohesive_modulus_n_per_m_n1 + self.frictional_modulus_n_per_m_n2 > 0.0
+    }
+}
+
+/// Contact behaviour of one kind of ground.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GroundMaterial {
+    /// Ground kind this material describes.
+    pub ground_type: GroundType,
+    /// Surface Coulomb friction coefficient, combined with the other collider's
+    /// coefficient by the backend's usual rule (Rapier: arithmetic mean).
+    pub friction: f32,
+    /// Upper bound on the combined coefficient before bulldozing is added,
+    /// typically `tan(φ)` of a soil's internal friction angle. Infinity for
+    /// rigid ground. Serialised as `null` when infinite.
+    #[serde(with = "unbounded_f32")]
+    pub max_friction: f32,
+    /// Coefficient of restitution, combined like [`PhysicsMaterial::restitution`].
+    pub restitution: f32,
+    /// Yielding behaviour; `None` for rigid ground.
+    pub deformation: Option<SoilDeformation>,
+}
+
+impl GroundMaterial {
+    /// Nominal material for `ground_type`.
+    ///
+    /// * Normal: rigid, friction 0.5, no restitution (the [`PhysicsMaterial`]
+    ///   default, so existing scenes behave the same).
+    /// * Rock: rigid, friction 0.9, restitution 0.05.
+    /// * Sand: Wong's dry sand (`k_c` = 0.99 kN/m^(n+1), `k_phi` = 1528 kN/m^(n+2),
+    ///   `n` = 1.1), internal friction angle ≈ 28° (`tan φ` ≈ 0.53), weak viscous
+    ///   term, firm layer at 0.10 m.
+    /// * Mud: soft wet clay (`n` = 0.5, low moduli), strong viscous term, 0.03 m/s
+    ///   creep, friction capped at 0.25, firm layer at 0.12 m.
+    pub fn preset(ground_type: GroundType) -> Self {
+        match ground_type {
+            GroundType::Normal => Self {
+                ground_type,
+                friction: 0.5,
+                max_friction: f32::INFINITY,
+                restitution: 0.0,
+                deformation: None,
+            },
+            GroundType::Rock => Self {
+                ground_type,
+                friction: 0.9,
+                max_friction: f32::INFINITY,
+                restitution: 0.05,
+                deformation: None,
+            },
+            GroundType::Sand => Self {
+                ground_type,
+                friction: 0.5,
+                max_friction: 0.53,
+                restitution: 0.0,
+                deformation: Some(SoilDeformation {
+                    cohesive_modulus_n_per_m_n1: 0.99e3,
+                    frictional_modulus_n_per_m_n2: 1528.43e3,
+                    sinkage_exponent: 1.1,
+                    viscous_damping_pa_s_per_m: 5.0e3,
+                    creep_velocity_m_s: 0.0,
+                    max_sinkage_m: 0.10,
+                    min_contact_radius_m: 0.02,
+                    bulldozing_friction_gain: 0.25,
+                }),
+            },
+            GroundType::Mud => Self {
+                ground_type,
+                friction: 0.3,
+                max_friction: 0.25,
+                restitution: 0.0,
+                deformation: Some(SoilDeformation {
+                    cohesive_modulus_n_per_m_n1: 2.0e3,
+                    frictional_modulus_n_per_m_n2: 300.0e3,
+                    sinkage_exponent: 0.5,
+                    viscous_damping_pa_s_per_m: 1.0e5,
+                    creep_velocity_m_s: 0.03,
+                    max_sinkage_m: 0.12,
+                    min_contact_radius_m: 0.02,
+                    bulldozing_friction_gain: 0.15,
+                }),
+            },
+        }
+    }
+
+    /// Whether the material's values are finite and in range.
+    pub fn is_valid(&self) -> bool {
+        self.friction.is_finite()
+            && self.friction >= 0.0
+            && !self.max_friction.is_nan()
+            && self.max_friction >= 0.0
+            && self.restitution.is_finite()
+            && (0.0..=1.0).contains(&self.restitution)
+            && self.deformation.is_none_or(|soil| soil.is_valid())
+    }
+}
+
+/// Serialises an `f32` whose infinity means "no bound" as `null`, because
+/// JSON has no infinity.
+mod unbounded_f32 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+        value.is_finite().then_some(*value).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+        Ok(Option::<f32>::deserialize(deserializer)?.unwrap_or(f32::INFINITY))
+    }
+}
+
+impl Default for GroundMaterial {
+    fn default() -> Self {
+        Self::preset(GroundType::Normal)
+    }
+}
+
+/// Marks a fixed terrain collider as a kind of ground.
+///
+/// Attach next to a [`Collider`]. The Rapier backend uses the material's
+/// friction and restitution in place of the collider's [`PhysicsMaterial`] and
+/// lets deformable ground yield under load (see [`SoilDeformation`]). Backends
+/// that do not support ground surfaces treat the collider as plain rigid
+/// ground with its own [`PhysicsMaterial`].
+///
+/// For mixed terrain, set [`Self::map`] (see [`Self::mapped`]): each contact
+/// then takes the material the [`GroundTypeMap`] gives at its position, so one
+/// height field can hold rock, sand and mud side by side.
+#[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GroundSurface {
+    /// Contact behaviour of this ground. With a [`Self::map`] it is only the
+    /// collider-level material other systems see; the map decides every
+    /// contact.
+    pub material: GroundMaterial,
+    /// Per-point materials over the collider's footprint, if mixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<GroundTypeMap>,
+}
+
+impl GroundSurface {
+    /// Ground surface with the nominal material for `ground_type`.
+    pub fn new(ground_type: GroundType) -> Self {
+        Self::uniform(GroundMaterial::preset(ground_type))
+    }
+
+    /// Ground surface of one material everywhere.
+    pub fn uniform(material: GroundMaterial) -> Self {
+        Self {
+            material,
+            map: None,
+        }
+    }
+
+    /// Mixed ground: each contact uses the material `map` gives at its
+    /// position. [`Self::material`] is set to the map's first material.
+    pub fn mapped(map: GroundTypeMap) -> Self {
+        Self {
+            material: map.materials()[0],
+            map: Some(map),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ground_tests {
+    use super::*;
+
+    #[test]
+    fn rigid_presets_have_no_deformation() {
+        assert_eq!(
+            GroundMaterial::default(),
+            GroundMaterial::preset(GroundType::Normal)
+        );
+        for kind in [GroundType::Normal, GroundType::Rock] {
+            assert!(GroundMaterial::preset(kind).deformation.is_none());
+        }
+        let normal = GroundMaterial::preset(GroundType::Normal);
+        let plain = PhysicsMaterial::default();
+        assert_eq!(
+            (normal.friction, normal.restitution),
+            (plain.friction, plain.restitution)
+        );
+    }
+
+    #[test]
+    fn bearing_grows_with_sinkage_and_speed() {
+        for kind in [GroundType::Sand, GroundType::Mud] {
+            let soil = GroundMaterial::preset(kind).deformation.unwrap();
+            let radius = 0.015;
+            assert_eq!(soil.static_bearing_n(0.0, radius), 0.0);
+            let mut previous = 0.0;
+            for step in 1..50 {
+                let depth = step as f64 * 0.001;
+                let bearing = soil.static_bearing_n(depth, radius);
+                assert!(bearing > previous, "{kind:?} at {depth} m");
+                previous = bearing;
+            }
+            assert!(
+                soil.bearing_capacity_n(0.01, radius, 0.2) > soil.static_bearing_n(0.01, radius)
+            );
+            assert_eq!(
+                soil.bearing_capacity_n(0.01, radius, -0.2),
+                soil.static_bearing_n(0.01, radius)
+            );
+            assert!(soil
+                .static_bearing_n(soil.max_sinkage_m, radius)
+                .is_infinite());
+        }
+    }
+
+    #[test]
+    fn equilibrium_sinkage_inverts_static_bearing() {
+        let soil = GroundMaterial::preset(GroundType::Sand)
+            .deformation
+            .unwrap();
+        let depth = soil.equilibrium_sinkage_m(15.0, 0.015);
+        assert!((soil.static_bearing_n(depth, 0.015) - 15.0).abs() < 1.0e-6);
+        assert_eq!(soil.equilibrium_sinkage_m(0.0, 0.015), 0.0);
+        assert_eq!(soil.equilibrium_sinkage_m(1.0e9, 0.015), soil.max_sinkage_m);
+        // Mud carries less than sand at the same shallow depth for a foot pad.
+        let mud = GroundMaterial::preset(GroundType::Mud).deformation.unwrap();
+        assert!(mud.equilibrium_sinkage_m(15.0, 0.015) > 0.0);
+    }
+
+    #[test]
+    fn invalid_materials_are_rejected() {
+        let mut sand = GroundMaterial::preset(GroundType::Sand);
+        assert!(sand.is_valid());
+        sand.restitution = 2.0;
+        assert!(!sand.is_valid());
+        let mut mud = GroundMaterial::preset(GroundType::Mud);
+        if let Some(soil) = mud.deformation.as_mut() {
+            soil.sinkage_exponent = 0.0;
+        }
+        assert!(!mud.is_valid());
     }
 }

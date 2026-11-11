@@ -95,6 +95,39 @@ pub struct ContactPointSample {
     pub normal_force_n: f64,
 }
 
+/// One contact point between a body and a [`crate::GroundSurface`] collider.
+///
+/// Backends that support ground surfaces report these after each completed
+/// step. They are simulation ground truth for validating terrain perception,
+/// not a sensor: no noise or latency is applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroundContactSample {
+    /// Entity touching the ground.
+    pub entity: Entity,
+    /// Ground collider entity.
+    pub ground_entity: Entity,
+    /// Kind of ground touched.
+    pub ground_type: crate::GroundType,
+    /// Contact point in world coordinates, in meters.
+    pub point_world_m: Vec3,
+    /// Unit ground normal pointing out of the ground, in world coordinates.
+    pub ground_normal_world: Vec3,
+    /// Depth below the undisturbed ground surface at the start of the step, in meters.
+    pub sinkage_m: f64,
+    /// Speed at which the contact was sinking into the ground, in m/s.
+    pub sink_velocity_m_s: f64,
+    /// Non-negative average normal force over the completed step, in newtons.
+    pub normal_force_n: f64,
+    /// Normal force the ground could carry before yielding, in newtons.
+    /// Infinite for rigid ground and below the firm layer.
+    pub bearing_capacity_n: f64,
+    /// Effective friction coefficient the solver used.
+    pub friction: f64,
+    /// Whether the contact was yielding, i.e. the normal force reached the
+    /// bearing capacity and the contact sank further during the step.
+    pub yielding: bool,
+}
+
 /// Raycast query definition.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RaycastQuery {

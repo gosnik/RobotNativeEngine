@@ -5,6 +5,7 @@
 pub mod backend;
 pub mod components;
 pub mod events;
+pub mod ground_map;
 pub mod hash;
 pub mod hydrodynamics;
 pub mod snapshot;
@@ -18,16 +19,18 @@ pub use backend::{
 };
 pub use components::{
     Collider, ColliderPart, ColliderShape, CollisionGroups, CommandedKinematicPose,
-    CompoundCollider, CompoundPart, ConvexCollider, FixedJointDesc, GravityScale, JointActuation,
-    JointEffortMeasurement, JointMotor, JointMotorGainModel, JointPassiveDynamics,
-    JointPositionMotorDiagnostics, JointState, MultibodyLink, PhysicsMaterial, PhysicsOwnedPose,
-    PositionMotorDiagnosticInterval, PrismaticJointDesc, RevoluteJointArmature, RevoluteJointDesc,
-    RigidBody, RigidBodyInertia, RigidBodyType, SelfCollisionExclusion,
+    CompoundCollider, CompoundPart, ConvexCollider, FixedJointDesc, GravityScale, GroundMaterial,
+    GroundSurface, GroundType, JointActuation, JointEffortMeasurement, JointMotor,
+    JointMotorGainModel, JointPassiveDynamics, JointPositionMotorDiagnostics, JointState,
+    MultibodyLink, PhysicsMaterial, PhysicsOwnedPose, PositionMotorDiagnosticInterval,
+    PrismaticJointDesc, RevoluteJointArmature, RevoluteJointDesc, RigidBody, RigidBodyInertia,
+    RigidBodyType, SelfCollisionExclusion, SoilDeformation,
 };
 pub use events::{
-    ContactEvent, ContactPointSample, ContactSeparationSample, ExternalBodyWrench, RaycastHit,
-    RaycastQuery,
+    ContactEvent, ContactPointSample, ContactSeparationSample, ExternalBodyWrench,
+    GroundContactSample, RaycastHit, RaycastQuery,
 };
+pub use ground_map::{GroundMapColor, GroundMapEncoding, GroundTypeMap, GroundTypeMapError};
 pub use hash::{hash_physics_state, hash_physics_state_v2};
 pub use hydrodynamics::{
     HydrodynamicCoefficients, HydrodynamicMesh, HydrodynamicWrench, HydrodynamicsError,

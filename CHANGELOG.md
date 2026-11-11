@@ -4,6 +4,28 @@ All notable changes to Robot Native Engine are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Selectable ground types (`GroundSurface`, `GroundType::{Normal, Rock, Sand,
+  Mud}`, `GroundMaterial`, `SoilDeformation`) in `rne_physics`. The Rapier
+  backend makes sand and mud yield under load (Bekker pressure-sinkage with a
+  viscous term, plastic displacement, creep for mud, a firm layer), applies
+  per-ground friction and restitution, and reports `GroundContactSample`s via
+  `RapierBackend::ground_contacts`. The vendored Rapier solver gains a
+  per-contact `max_normal_force`. See `docs/GROUND_TYPES.md`.
+- Mixed terrain: `GroundSurface::mapped(GroundTypeMap)` assigns a ground
+  material per point from a grid laid over the collider footprint, such as a
+  PNG painted to match a heightmap (`GroundTypeMap::from_png` with a colour
+  legend). `GroundMaterial` serialises an unbounded `max_friction` as `null`.
+- RGB parameter ground maps (`GroundMapEncoding`, `GroundTypeMap::from_encoded_png`):
+  R selects the type, G the friction (0–2), and B the soil deformability and
+  creep per pixel. Map cells are now `u16` palette indices.
+- Lowered (deformable or mixed) ground measures contact depth from the authored
+  surface on slopes, puts solver contact points at the authored surface, and
+  drops skin-rounded edge contacts only when the shape also has a face
+  contact. Feet on slopes near the edge-normal tilt no longer lose support and
+  sink, and normal cells of a mixed map support bodies like plain terrain.
+
 ### Fixed
 
 - Accept `.` and `..` as installed bundle roots in the source-free flagship
