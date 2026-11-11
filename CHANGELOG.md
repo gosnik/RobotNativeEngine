@@ -17,6 +17,11 @@ All notable changes to Robot Native Engine are documented in this file.
   material per point from a grid laid over the collider footprint, such as a
   PNG painted to match a heightmap (`GroundTypeMap::from_png` with a colour
   legend). `GroundMaterial` serialises an unbounded `max_friction` as `null`.
+- Lowered (deformable or mixed) ground measures contact depth from the authored
+  surface on slopes, puts solver contact points at the authored surface, and
+  drops skin-rounded edge contacts only when the shape also has a face
+  contact. Feet on slopes near the edge-normal tilt no longer lose support and
+  sink, and normal cells of a mixed map support bodies like plain terrain.
 
 ### Fixed
 

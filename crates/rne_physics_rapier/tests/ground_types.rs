@@ -555,3 +555,154 @@ fn mixed_ground_map_sets_friction_per_patch() {
         "rock {on_rock} m, normal {on_normal} m"
     );
 }
+
+/// Runs one body on a 2 m × 2 m height field tilted along X by `slope_deg`,
+/// with `surface` (or a plain collider), and returns its pose each step.
+fn pose_trace_on_height_field(
+    surface: Option<GroundSurface>,
+    body: Collider,
+    start: Vec3,
+    velocity: Vec3,
+    slope_deg: f64,
+    steps: usize,
+) -> Vec<(Vec3, rne_math::Quat)> {
+    let mut backend = RapierBackend::new();
+    let world_id = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+    let mut world = World::new();
+    let n = 21;
+    let grade = slope_deg.to_radians().tan();
+    let heights: Vec<f64> = (0..n * n)
+        .map(|i| (i % n) as f64 / (n - 1) as f64 * 2.0 * grade)
+        .collect();
+    let ground = world
+        .spawn((
+            Transform3::from_translation_rotation(Vec3::ZERO, rne_math::Quat::IDENTITY),
+            RigidBody {
+                body_type: RigidBodyType::Fixed,
+                ..RigidBody::default()
+            },
+            Collider {
+                shape: rne_physics::ColliderShape::HeightField {
+                    nrows: n as u32,
+                    ncols: n as u32,
+                    heights_m: heights.into(),
+                    scale: Vec3::new(2.0, 1.0, 2.0),
+                },
+                ..Collider::default()
+            },
+        ))
+        .id();
+    if let Some(surface) = surface {
+        world.entity_mut(ground).insert(surface);
+    }
+    let body = world
+        .spawn((
+            Transform3::from_translation_rotation(start, rne_math::Quat::IDENTITY),
+            RigidBody {
+                mass_kg: 1.0,
+                linear_velocity_m_s: velocity,
+                ..RigidBody::default()
+            },
+            body,
+        ))
+        .id();
+    (0..steps)
+        .map(|_| {
+            backend.sync_from_ecs(&mut world, world_id).unwrap();
+            backend
+                .step(world_id, SimDuration::from_ticks(DT_NS))
+                .unwrap();
+            backend.sync_to_ecs(&mut world, world_id).unwrap();
+            let pose = world.get::<Transform3>(body).unwrap();
+            (pose.translation, pose.rotation)
+        })
+        .collect()
+}
+
+/// Normal ground everywhere except one mud sample in the far corner, so the
+/// collider is lowered and skinned for soil.
+fn normal_map_with_distant_mud() -> GroundSurface {
+    let mut types = vec![GroundType::Normal; 25];
+    types[24] = GroundType::Mud;
+    GroundSurface::mapped(rne_physics::GroundTypeMap::from_ground_types(5, 5, &types).unwrap())
+}
+
+#[test]
+fn normal_cells_of_a_lowered_map_behave_like_plain_terrain() {
+    // The mud sample lowers and skins the whole collider. Normal cells must
+    // still support bodies at the authored surface, with the friction and
+    // lever arms of plain terrain.
+    let slope_deg: f64 = 20.0;
+    let grade = slope_deg.to_radians().tan();
+    let cases = [
+        // A small toe rolling across a 20° slope and over triangle edges.
+        (
+            Collider::sphere(0.01),
+            -0.3,
+            Vec3::new(0.3, 0.0, 0.2),
+            slope_deg,
+            0.012,
+            180.0,
+        ),
+        // A block resting on the slope.
+        (
+            Collider::cuboid(Vec3::new(0.05, 0.02, 0.05)),
+            -0.3,
+            Vec3::ZERO,
+            slope_deg,
+            0.004,
+            4.0,
+        ),
+    ];
+    for (body, x, velocity, slope, max_offset_m, max_angle_deg) in cases {
+        let grade_here = slope.to_radians().tan();
+        let start = Vec3::new(x, (x + 1.0) * grade_here + 0.021, 0.0);
+        let plain = pose_trace_on_height_field(None, body.clone(), start, velocity, slope, 600);
+        let mapped = pose_trace_on_height_field(
+            Some(normal_map_with_distant_mud()),
+            body.clone(),
+            start,
+            velocity,
+            slope,
+            600,
+        );
+        for (step, ((p0, q0), (p1, q1))) in plain.iter().zip(&mapped).enumerate() {
+            let offset = (*p0 - *p1).length();
+            let angle = q0.angle_between(*q1).to_degrees();
+            assert!(
+                offset < max_offset_m && angle < max_angle_deg,
+                "{body:?} step {step}: {offset} m, {angle} deg"
+            );
+        }
+        if body.shape == Collider::sphere(0.01).shape {
+            // Rests on the authored slope (centre r / cos θ above it) and never
+            // sinks into the skin, unlike the edge-contact bug that let it
+            // drop 3 cm.
+            let rest_m = 0.01 / slope_deg.to_radians().cos();
+            for (step, (p, _)) in mapped.iter().enumerate().skip(100) {
+                let above = p.y - (p.x + 1.0) * grade;
+                assert!((above - rest_m).abs() < 1.5e-3, "step {step}: {above} m");
+            }
+        }
+    }
+    // A block braking from 1 m/s on flat normal cells slides v²/(2μg) with the
+    // combined μ = 0.5 (plain height fields can instead catch a triangle edge).
+    let body = Collider::cuboid(Vec3::new(0.05, 0.02, 0.05));
+    let start = Vec3::new(-0.5, 0.021, 0.0);
+    let trace = pose_trace_on_height_field(
+        Some(normal_map_with_distant_mud()),
+        body,
+        start,
+        Vec3::new(1.0, 0.0, 0.0),
+        0.0,
+        600,
+    );
+    let (end, rotation) = *trace.last().unwrap();
+    let expected_m = 1.0 / (2.0 * 0.5 * 9.81);
+    let slid_m = end.x - start.x;
+    assert!(
+        (slid_m - expected_m).abs() < 0.08 * expected_m,
+        "{slid_m} m"
+    );
+    assert!(rotation.angle_between(rne_math::Quat::IDENTITY) < 0.01);
+}

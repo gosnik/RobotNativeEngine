@@ -68,7 +68,9 @@ colour, so anti-aliased brush edges are fine:
   while its neighbour sinks.
 - A collider whose map has any soft ground is lowered by the deepest soil layer
   (see the implementation notes). Rigid patches still support contacts at the
-  authored surface through the contact skin.
+  authored surface with plain-terrain friction and lever arms, but the contact
+  geometry is generated differently, so replays are not bit-identical to an
+  unmapped collider. Compare runs that use the same map.
 
 ## Deformable ground model
 
@@ -115,14 +117,18 @@ latency. The normal force uses the same convention as `contact_points()`.
 - A deformable ground collider is moved down to its firm layer and given a
   contact skin of the soil depth. Contacts therefore start at the authored
   surface, and a shape that sinks into the soil never passes through the
-  collider geometry (which would lose the contact on a height field). On a
-  sloped height field the skin is applied along the face normal while the
-  collider is lowered vertically, so the effective surface sits
-  `depth · (1 − cos θ)` above the authored one (3 mm at 20° for 0.05 m).
+  collider geometry (which would lose the contact on a height field). The
+  backend measures contact depth from the authored surface (on a slope the
+  vertical lowering is `depth · cos θ` along the face normal) and places each
+  solver contact point at the authored surface, so support and friction act
+  with the same lever arms as on plain terrain.
 - Ray casts that hit deformable ground report the undisturbed surface, and
   `contact_separations()` subtracts contact skins.
-- When a shape sunk into the skin touches several height-field triangles, only
-  the face whose normal best matches the ground's up axis (from the previous
-  step) carries the contact; the others are skin-rounded edges.
+- The skin also rounds the edges of neighbouring triangles, so a shape over or
+  sunk into lowered ground touches those edges with tilted normals. While a
+  shape has a face contact (normal along its triangle's own normal), its edge
+  contacts are dropped; a shape resting only on edges, such as a real ridge,
+  keeps them. This also removes the internal-edge snagging that plain height
+  fields show.
 - Per-contact soil state (displaced depth and accumulated creep) is kept in the
   contact manifold and resets when the manifold disappears.

@@ -37,7 +37,7 @@ use rne_physics::{
 #[cfg(feature = "position-motor-diagnostics")]
 use rne_physics::{JointPositionMotorDiagnostics, PositionMotorDiagnosticInterval};
 use rne_world::{world_transform_of, Transform3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const CAPABILITIES: &[PhysicsCapability] = &[
     PhysicsCapability::RigidBody,
@@ -99,8 +99,9 @@ struct RapierWorldState {
     ground_lowered_poses: HashMap<ColliderHandle, Isometry<Real>>,
     /// Contacts with ground surfaces from the last completed step.
     ground_contacts: Vec<GroundContactSample>,
-    /// Supporting ground subshape per touching shape, refreshed before each step.
-    ground_supports: HashMap<(ColliderHandle, ColliderHandle, u32), u32>,
+    /// (ground, touching collider, touching subshape) keys that had a face
+    /// contact with lowered ground in the previous step.
+    ground_supports: HashSet<(ColliderHandle, ColliderHandle, u32)>,
     entity_to_joint: HashMap<Entity, ImpulseJointHandle>,
     entity_to_multibody_joint: HashMap<Entity, MultibodyJointHandle>,
     /// Welds on articulated links: a [`FixedJointDesc`] on an entity whose own
@@ -194,9 +195,9 @@ struct OwnerCollisionHooks<'a> {
     substep_dt_s: f32,
     /// Duration of the whole step, in seconds.
     step_dt_s: f32,
-    /// Supporting ground subshape per (ground, touching collider, touching
-    /// subshape), chosen from the previous step's manifolds.
-    ground_supports: &'a HashMap<(ColliderHandle, ColliderHandle, u32), u32>,
+    /// (ground, touching collider, touching subshape) keys that had a face
+    /// contact with lowered ground in the previous step.
+    ground_supports: &'a HashSet<(ColliderHandle, ColliderHandle, u32)>,
 }
 
 impl OwnerCollisionHooks<'_> {
@@ -298,6 +299,12 @@ impl OwnerCollisionHooks<'_> {
             return;
         }
         let layout = &self.ground_materials[&ground_handle];
+        let ground_normal = if ground_is_first {
+            *context.normal
+        } else {
+            -*context.normal
+        };
+        measure_from_authored_surface(context.solver_contacts, &ground_normal, layout.lowered_m);
         // One material per manifold, taken where it presses deepest.
         let Some(deepest) = context
             .solver_contacts
@@ -313,30 +320,24 @@ impl OwnerCollisionHooks<'_> {
         let base = layout.surface.material;
         let friction_shift = (material.friction - base.friction) * 0.5;
         let restitution_shift = (material.restitution - base.restitution) * 0.5;
-        let ground_normal = if ground_is_first {
-            *context.normal
-        } else {
-            -*context.normal
-        };
-        let other_subshape = if ground_is_first {
-            context.manifold.subshape2
-        } else {
-            context.manifold.subshape1
-        };
         let soil = material.deformation;
-        let ground_subshape = if ground_is_first {
-            context.manifold.subshape1
+        let (ground_subshape, other_subshape) = if ground_is_first {
+            (context.manifold.subshape1, context.manifold.subshape2)
         } else {
-            context.manifold.subshape2
+            (context.manifold.subshape2, context.manifold.subshape1)
         };
-        if layout.soil_depth_m > 0.0
+        if layout.lowered_m > 0.0
             && self
                 .ground_supports
-                .get(&(ground_handle, other_handle, other_subshape))
-                .is_some_and(|support| *support != ground_subshape)
+                .contains(&(ground_handle, other_handle, other_subshape))
+            && !is_face_contact(
+                &context.colliders[ground_handle],
+                ground_subshape,
+                &ground_normal,
+            )
         {
-            // Another ground face supports this shape; drop the skin-rounded
-            // edge contact and forget its displaced depth.
+            // A ground face supports this shape; drop the skin-rounded edge
+            // contact and forget its displaced depth.
             context.solver_contacts.clear();
             *context.user_data = 0;
             return;
@@ -461,6 +462,30 @@ impl OwnerCollisionHooks<'_> {
     }
 }
 
+/// Re-expresses solver contacts against ground lowered by `lowered_m` (along
+/// world −Y, with a contact skin of the same size) relative to the authored
+/// surface.
+///
+/// Rapier subtracted the skin along the contact normal, but planes `lowered_m`
+/// apart vertically are only `lowered_m · cos θ` apart along a normal tilted θ
+/// from vertical. The solver point (the midpoint of the two witnesses) also
+/// moves up to where the authored surface would put it, so friction and
+/// support act at the real contact, not half the soil depth below it.
+fn measure_from_authored_surface(
+    contacts: &mut [SolverContact],
+    ground_normal: &Vector<Real>,
+    lowered_m: Real,
+) {
+    if lowered_m <= 0.0 {
+        return;
+    }
+    let along_normal = lowered_m * ground_normal.y.clamp(0.0, 1.0);
+    for contact in contacts {
+        contact.dist += lowered_m - along_normal;
+        contact.point += ground_normal * (0.5 * along_normal);
+    }
+}
+
 /// Soil state of one ground contact manifold, packed into Rapier's 32-bit
 /// manifold user data as two 16-bit fractions of the soil depth: the depth
 /// already displaced (0 = not yet set) and the accumulated creep.
@@ -538,20 +563,44 @@ fn contact_radius_m(collider: &rapier3d::geometry::Collider, subshape: u32) -> O
     None
 }
 
-/// Chooses, for each collider part touching a ground surface across several
-/// ground subshapes (height-field triangles), the one subshape whose contact
-/// normal is closest to the ground's up axis in the previous step.
+/// Whether a ground contact normal is its ground triangle's own face normal
+/// rather than a skin-rounded edge or vertex. Non-mesh ground is all face.
+fn is_face_contact(
+    ground: &rapier3d::geometry::Collider,
+    ground_subshape: u32,
+    ground_normal: &Vector<Real>,
+) -> bool {
+    // Within about 1.8°: Parry reports face contacts along the exact triangle
+    // normal, while edge contacts tilt towards the touching shape.
+    const MIN_ALIGNMENT: Real = 0.9995;
+    let shape = ground.shape();
+    let triangle = match (shape.as_heightfield(), shape.as_trimesh()) {
+        (Some(field), _) => field.triangle_at_id(ground_subshape),
+        (None, Some(mesh)) if (ground_subshape as usize) < mesh.indices().len() => {
+            Some(mesh.triangle(ground_subshape))
+        }
+        _ => return true,
+    };
+    triangle
+        .and_then(|triangle| triangle.normal())
+        .is_none_or(|face| {
+            (ground.position().rotation * face.into_inner()).dot(ground_normal) >= MIN_ALIGNMENT
+        })
+}
+
+/// Records, from the previous step's manifolds, which shapes touching lowered
+/// ground had at least one face contact.
 ///
 /// Deformable ground is lowered and given a contact skin; the skin rounds the
-/// edges of neighbouring triangles, so a shape sunk into it also touches those
-/// edges with tilted normals. Only the supporting face carries the contact.
+/// edges of neighbouring triangles, so a shape over or sunk into it also
+/// touches those edges with tilted normals that plain ground would not
+/// produce. While a shape has a face contact, its edge contacts are dropped;
+/// a shape resting only on edges (a real ridge) keeps them.
 fn select_ground_supports(state: &mut RapierWorldState) {
     state.ground_supports.clear();
     if state.ground_materials.is_empty() {
         return;
     }
-    let mut best: HashMap<(ColliderHandle, ColliderHandle, u32), (f32, u32, usize)> =
-        HashMap::new();
     for pair in state.narrow_phase.contact_pairs() {
         let (ground, other, ground_is_first) =
             if state.ground_materials.contains_key(&pair.collider1) {
@@ -561,10 +610,12 @@ fn select_ground_supports(state: &mut RapierWorldState) {
             } else {
                 continue;
             };
+        if state.ground_materials[&ground].lowered_m <= 0.0 {
+            continue;
+        }
         let Some(ground_collider) = state.colliders.get(ground) else {
             continue;
         };
-        let up = ground_collider.position().rotation * Vector::y();
         for manifold in &pair.manifolds {
             if manifold.points.is_empty() {
                 continue;
@@ -578,23 +629,13 @@ fn select_ground_supports(state: &mut RapierWorldState) {
                     -manifold.data.normal,
                 )
             };
-            let score = normal.dot(&up);
-            let entry =
-                best.entry((ground, other, other_subshape))
-                    .or_insert((score, ground_subshape, 0));
-            entry.2 += 1;
-            if score > entry.0 + 1.0e-4 || (score >= entry.0 - 1.0e-4 && ground_subshape < entry.1)
-            {
-                entry.0 = score;
-                entry.1 = ground_subshape;
+            if is_face_contact(ground_collider, ground_subshape, &normal) {
+                state
+                    .ground_supports
+                    .insert((ground, other, other_subshape));
             }
         }
     }
-    state.ground_supports.extend(
-        best.into_iter()
-            .filter(|(_, (_, _, count))| *count > 1)
-            .map(|(key, (_, subshape, _))| (key, subshape)),
-    );
 }
 
 fn advance_rapier_pipeline(state: &mut RapierWorldState) {
@@ -1169,7 +1210,7 @@ impl PhysicsBackend for RapierBackend {
                 ground_materials: HashMap::new(),
                 ground_lowered_poses: HashMap::new(),
                 ground_contacts: Vec::new(),
-                ground_supports: HashMap::new(),
+                ground_supports: HashSet::new(),
                 entity_to_joint: HashMap::new(),
                 entity_to_multibody_joint: HashMap::new(),
                 entity_to_attachment: HashMap::new(),
@@ -1675,15 +1716,18 @@ impl PhysicsBackend for RapierBackend {
             filter,
             |collider_handle, intersection| {
                 if let Some(entity) = state.collider_to_entity.get(&collider_handle).copied() {
-                    // Deformable ground is lowered by its contact skin; report
-                    // the hit on the undisturbed surface the skin represents.
+                    // Deformable ground is lowered vertically by its contact
+                    // skin; report the hit on the undisturbed surface, which
+                    // lies `skin · n_y` further along the face normal.
                     let skin = state
                         .colliders
                         .get(collider_handle)
                         .map_or(0.0, |collider| collider.contact_skin());
                     let incidence = -ray.dir.dot(&intersection.normal);
                     let time_of_impact = if skin > 0.0 && incidence > 0.2 {
-                        (intersection.time_of_impact - skin / incidence).max(0.0)
+                        (intersection.time_of_impact
+                            - skin * intersection.normal.y.max(0.0) / incidence)
+                            .max(0.0)
                     } else {
                         intersection.time_of_impact
                     };
@@ -1836,7 +1880,9 @@ fn collect_ground_contacts(state: &mut RapierWorldState) {
                 .map_or(*collider2.position(), |child| collider2.position() * child);
             for (index, point) in manifold.points.iter().enumerate() {
                 let impulse = f64::from(point.data.impulse.max(0.0));
-                let surface_dist = point.dist - ground_collider.contact_skin();
+                // Distance from the authored surface (see apply_ground_material).
+                let surface_dist = point.dist - ground_collider.contact_skin()
+                    + layout.lowered_m * (1.0 - ground_normal.y.clamp(0.0, 1.0));
                 if surface_dist >= 0.0 && impulse == 0.0 {
                     continue;
                 }
