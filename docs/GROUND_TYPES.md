@@ -27,6 +27,49 @@ assumptions taken from textbook terramechanics, not measurements of a site.
 `normal` behaves exactly like a plain collider with the default material, so
 existing scenes are unchanged.
 
+## Mixed terrain from a ground map
+
+One collider can mix kinds with a `GroundTypeMap`, a grid of materials laid over
+the collider's horizontal footprint. Paint it as an image the same size as the
+terrain's heightmap, so each height sample gets one ground type:
+
+```rust
+use rne_physics::{GroundSurface, GroundTypeMap};
+
+let map = GroundTypeMap::from_png(include_bytes!("terrain-ground.png"),
+                                  &GroundTypeMap::default_legend())?;
+world.entity_mut(terrain).insert(GroundSurface::mapped(map));
+```
+
+Default colour key (`GroundType::map_color_rgb`); each pixel takes the nearest
+colour, so anti-aliased brush edges are fine:
+
+| Kind   | Colour              |
+|--------|---------------------|
+| normal | green `#288C28`     |
+| rock   | grey `#808080`      |
+| sand   | yellow `#E6C850`    |
+| mud    | brown `#643C14`     |
+
+- Layout matches `ColliderShape::HeightField`: image columns run along local +X,
+  image rows along local +Z, and samples sit on the grid vertices. Pixel
+  `(0, 0)` is the −X/−Z corner and the last pixel the +X/+Z corner. A contact
+  takes the material of the nearest pixel.
+- Maps of any resolution are stretched over the footprint (the height field's
+  `scale.x` × `scale.z`, or another shape's local bounding box). Points beyond
+  the edge take the edge pixel.
+- A custom legend (`GroundMapColor { rgb, material }`) maps your own colours to
+  any `GroundMaterial`, for example a firmer sand. `GroundTypeMap::new` takes
+  raw indices and a palette of up to 256 materials, and
+  `GroundTypeMap::from_ground_types` takes a grid of `GroundType`s.
+- Each contact manifold uses the material under its deepest point. Friction and
+  restitution follow that material, and `GroundContactSample::ground_type`
+  reports it, so a foot on a rock patch beside a mud pool is rigid and grippy
+  while its neighbour sinks.
+- A collider whose map has any soft ground is lowered by the deepest soil layer
+  (see the implementation notes). Rigid patches still support contacts at the
+  authored surface through the contact skin.
+
 ## Deformable ground model
 
 Sand and mud carry a `SoilDeformation`. A contact patch of radius `b` (the

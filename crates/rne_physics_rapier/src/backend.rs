@@ -92,8 +92,8 @@ struct RapierWorldState {
     collider_owners: HashMap<ColliderHandle, Entity>,
     /// Per-compound-child friction overrides, keyed by Rapier's compound subshape ID.
     compound_part_frictions: HashMap<ColliderHandle, HashMap<u32, f32>>,
-    /// Ground materials of colliders carrying a [`GroundSurface`].
-    ground_materials: HashMap<ColliderHandle, GroundMaterial>,
+    /// Ground surfaces of colliders carrying a [`GroundSurface`].
+    ground_materials: HashMap<ColliderHandle, GroundLayout>,
     /// Original parent-relative pose of deformable ground colliders, which are
     /// lowered by their soil depth and given an equal contact skin.
     ground_lowered_poses: HashMap<ColliderHandle, Isometry<Real>>,
@@ -143,10 +143,53 @@ struct PositionMotorDiagnosticTarget {
     effort_ceiling: Option<f64>,
 }
 
+/// A [`GroundSurface`] as mirrored onto one Rapier collider.
+#[derive(Clone, Debug, PartialEq)]
+struct GroundLayout {
+    surface: GroundSurface,
+    /// Deepest soil layer of the surface's materials; deformable ground is
+    /// lowered by this much and given an equal contact skin, and per-manifold
+    /// soil state is stored as a fraction of it.
+    soil_depth_m: f64,
+    /// How far the collider was actually moved down along world −Y.
+    lowered_m: Real,
+    /// Collider-local XZ footprint a ground map spans: min X, min Z, size X,
+    /// size Z.
+    footprint: [f64; 4],
+}
+
+impl GroundLayout {
+    /// Material of the ground at a world point (the map's, for mixed ground).
+    fn material_at(
+        &self,
+        collider: &rapier3d::geometry::Collider,
+        world_point: &Point<Real>,
+    ) -> GroundMaterial {
+        let Some(map) = &self.surface.map else {
+            return self.surface.material;
+        };
+        // The map follows the authored (unlowered) collider pose.
+        let authored = world_point - Vector::y() * self.lowered_m;
+        let local = collider.position().inverse_transform_point(&authored);
+        let [min_x, min_z, size_x, size_z] = self.footprint;
+        let normalized = |value: Real, min: f64, size: f64| {
+            if size > 0.0 {
+                (f64::from(value) - min) / size
+            } else {
+                0.5
+            }
+        };
+        *map.material_at(
+            normalized(local.x, min_x, size_x),
+            normalized(local.z, min_z, size_z),
+        )
+    }
+}
+
 struct OwnerCollisionHooks<'a> {
     owners: &'a HashMap<ColliderHandle, Entity>,
     compound_part_frictions: &'a HashMap<ColliderHandle, HashMap<u32, f32>>,
-    ground_materials: &'a HashMap<ColliderHandle, GroundMaterial>,
+    ground_materials: &'a HashMap<ColliderHandle, GroundLayout>,
     /// Duration of one solver substep, in seconds.
     substep_dt_s: f32,
     /// Duration of the whole step, in seconds.
@@ -254,7 +297,22 @@ impl OwnerCollisionHooks<'_> {
             // Ground against ground keeps Rapier's rigid behaviour.
             return;
         }
-        let material = self.ground_materials[&ground_handle];
+        let layout = &self.ground_materials[&ground_handle];
+        // One material per manifold, taken where it presses deepest.
+        let Some(deepest) = context
+            .solver_contacts
+            .iter()
+            .min_by(|a, b| a.dist.total_cmp(&b.dist))
+        else {
+            return;
+        };
+        let material = layout.material_at(&context.colliders[ground_handle], &deepest.point);
+        // Rapier combined the collider-level friction and restitution (the
+        // surface's base material); swap in this point's material under the
+        // same averaging rule.
+        let base = layout.surface.material;
+        let friction_shift = (material.friction - base.friction) * 0.5;
+        let restitution_shift = (material.restitution - base.restitution) * 0.5;
         let ground_normal = if ground_is_first {
             *context.normal
         } else {
@@ -271,7 +329,7 @@ impl OwnerCollisionHooks<'_> {
         } else {
             context.manifold.subshape2
         };
-        if soil.is_some()
+        if layout.soil_depth_m > 0.0
             && self
                 .ground_supports
                 .get(&(ground_handle, other_handle, other_subshape))
@@ -306,13 +364,17 @@ impl OwnerCollisionHooks<'_> {
         };
         // Per-manifold soil state persisted in the manifold's user data.
         let stored =
-            soil.map(|soil| SoilContactState::decode(*context.user_data, soil.max_sinkage_m));
+            soil.map(|_| SoilContactState::decode(*context.user_data, layout.soil_depth_m));
         let stored_reference_m = stored.and_then(|state| state.reference_m);
-        let mut reference_m = stored_reference_m.unwrap_or(0.0);
+        let mut reference_m = stored_reference_m
+            .unwrap_or(0.0)
+            .min(soil.map_or(0.0, |soil| soil.max_sinkage_m));
         let creep_m = stored.map_or(0.0, |state| state.creep_m);
         let mut creep_rate_m_s: f64 = 0.0;
         let substep_dt_s = f64::from(self.substep_dt_s);
         for contact in &mut *context.solver_contacts {
+            contact.friction = (contact.friction + friction_shift).max(0.0);
+            contact.restitution = (contact.restitution + restitution_shift).max(0.0);
             let base_friction = contact.friction.min(material.max_friction);
             let Some(soil) = soil else {
                 contact.friction = base_friction;
@@ -384,13 +446,17 @@ impl OwnerCollisionHooks<'_> {
                 Real::MAX
             };
         }
-        if let Some(soil) = soil {
-            *context.user_data = SoilContactState {
-                reference_m: Some(reference_m),
-                creep_m: (creep_m + creep_rate_m_s * f64::from(self.step_dt_s))
-                    .min(soil.max_sinkage_m),
+        match soil {
+            Some(soil) => {
+                *context.user_data = SoilContactState {
+                    reference_m: Some(reference_m),
+                    creep_m: (creep_m + creep_rate_m_s * f64::from(self.step_dt_s))
+                        .min(soil.max_sinkage_m),
+                }
+                .encode(layout.soil_depth_m);
             }
-            .encode(soil.max_sinkage_m);
+            // Rigid patch of mixed ground: no displaced soil to remember.
+            None => *context.user_data = 0,
         }
     }
 }
@@ -1725,7 +1791,7 @@ fn collect_ground_contacts(state: &mut RapierWorldState) {
         if state.ground_materials.contains_key(&other_handle) {
             continue;
         }
-        let material = state.ground_materials[&ground_handle];
+        let layout = &state.ground_materials[&ground_handle];
         let (Some(&ground_entity), Some(&entity)) = (
             state.collider_to_entity.get(&ground_handle),
             state.collider_to_entity.get(&other_handle),
@@ -1781,6 +1847,7 @@ fn collect_ground_contacts(state: &mut RapierWorldState) {
                 } else {
                     shape1_position * point.local_p1
                 };
+                let material = layout.material_at(ground_collider, &point_world);
                 let sinkage_m = f64::from((-surface_dist).max(0.0));
                 let sink_velocity_m_s = f64::from(
                     -(body_velocity(other_collider, &point_world)
@@ -1919,59 +1986,86 @@ fn sync_ground_surface(world: &World, state: &mut RapierWorldState, entity: Enti
     let Some(handle) = state.entity_to_collider.get(&entity).copied() else {
         return;
     };
-    let material = world
-        .get::<GroundSurface>(entity)
-        .map(|surface| surface.material)
-        .filter(GroundMaterial::is_valid);
-    if state.ground_materials.get(&handle).copied() == material {
+    let surface = world.get::<GroundSurface>(entity).filter(|surface| {
+        surface.material.is_valid() && surface.map.as_ref().is_none_or(|map| map.is_valid())
+    });
+    let current = state
+        .ground_materials
+        .get(&handle)
+        .map(|layout| &layout.surface);
+    if current == surface {
         return;
     }
-    let (friction, restitution) = match material {
-        Some(material) => {
-            state.ground_materials.insert(handle, material);
-            (material.friction, material.restitution)
-        }
-        None => {
-            state.ground_materials.remove(&handle);
-            world
-                .get::<Collider>(entity)
-                .map_or((0.5, 0.0), |collider| {
-                    (collider.material.friction, collider.material.restitution)
-                })
-        }
+    let surface = surface.cloned();
+    let (friction, restitution) = match &surface {
+        Some(surface) => (surface.material.friction, surface.material.restitution),
+        None => world
+            .get::<Collider>(entity)
+            .map_or((0.5, 0.0), |collider| {
+                (collider.material.friction, collider.material.restitution)
+            }),
     };
-    let soil_depth_m = material
-        .and_then(|material| material.deformation)
-        .map_or(0.0, |soil| soil.max_sinkage_m as Real);
+    let soil_depth_m = surface.as_ref().map_or(0.0, |surface| match &surface.map {
+        Some(map) => map.max_sinkage_m(),
+        None => surface
+            .material
+            .deformation
+            .map_or(0.0, |soil| soil.max_sinkage_m),
+    });
     let original_pose = state.ground_lowered_poses.remove(&handle);
+    let mut lowered_m: Real = 0.0;
+    let mut footprint = [0.0; 4];
     if let Some(collider) = state.colliders.get_mut(handle) {
         collider.set_friction(friction);
         collider.set_restitution(restitution);
         // Deformable ground: move the collider down to the firm layer and add
         // a contact skin of the soil depth, so contacts begin at the authored
         // surface while shapes sinking into the soil never pass through the
-        // collider geometry (which would lose the contact).
+        // collider geometry (which would lose the contact). Mixed ground is
+        // lowered by its deepest soil; its rigid patches stay at the authored
+        // surface through the same skin.
         if let Some(original) = original_pose {
             collider.set_position_wrt_parent(original);
             collider.set_contact_skin(0.0);
         }
         if soil_depth_m > 0.0 {
             if let Some(original) = collider.position_wrt_parent().copied() {
+                let depth = soil_depth_m as Real;
                 let parent_rotation = collider.position().rotation * original.rotation.inverse();
                 let lowered = Isometry::from_parts(
                     (original.translation.vector
-                        + parent_rotation.inverse_transform_vector(&Vector::new(
-                            0.0,
-                            -soil_depth_m,
-                            0.0,
-                        )))
+                        + parent_rotation.inverse_transform_vector(&Vector::new(0.0, -depth, 0.0)))
                     .into(),
                     original.rotation,
                 );
                 collider.set_position_wrt_parent(lowered);
-                collider.set_contact_skin(soil_depth_m);
+                collider.set_contact_skin(depth);
                 state.ground_lowered_poses.insert(handle, original);
+                lowered_m = depth;
             }
+        }
+        let aabb = collider.shape().compute_local_aabb();
+        footprint = [
+            f64::from(aabb.mins.x),
+            f64::from(aabb.mins.z),
+            f64::from(aabb.maxs.x - aabb.mins.x),
+            f64::from(aabb.maxs.z - aabb.mins.z),
+        ];
+    }
+    match surface {
+        Some(surface) => {
+            state.ground_materials.insert(
+                handle,
+                GroundLayout {
+                    surface,
+                    soil_depth_m,
+                    lowered_m,
+                    footprint,
+                },
+            );
+        }
+        None => {
+            state.ground_materials.remove(&handle);
         }
     }
     state.query_pipeline_needs_rebuild = true;

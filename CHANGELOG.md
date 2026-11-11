@@ -13,6 +13,10 @@ All notable changes to Robot Native Engine are documented in this file.
   per-ground friction and restitution, and reports `GroundContactSample`s via
   `RapierBackend::ground_contacts`. The vendored Rapier solver gains a
   per-contact `max_normal_force`. See `docs/GROUND_TYPES.md`.
+- Mixed terrain: `GroundSurface::mapped(GroundTypeMap)` assigns a ground
+  material per point from a grid laid over the collider footprint, such as a
+  PNG painted to match a heightmap (`GroundTypeMap::from_png` with a colour
+  legend). `GroundMaterial` serialises an unbounded `max_friction` as `null`.
 
 ### Fixed
 

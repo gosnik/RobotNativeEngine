@@ -224,16 +224,24 @@ fn soft_ground_softens_the_impact() {
 
 /// Slides a block at 1 m/s and returns how far it travels in one second.
 fn slide_distance_m(ground: GroundType) -> f64 {
-    let half = Vec3::new(0.05, 0.02, 0.05);
+    slide_distance_on_m(GroundSurface::new(ground), 0.0)
+}
+
+/// Slides a block from `x_m` at 1 m/s over a 10 m ground slab with `surface`
+/// and returns how far it travels in one second.
+fn slide_distance_on_m(surface: GroundSurface, x_m: f64) -> f64 {
+    // Flat enough that the braking torque cannot rock it onto its edge.
+    let half = Vec3::new(0.05, 0.005, 0.05);
     let mut scene = Scene::new(
-        Some(ground),
+        None,
         (
             Collider::cuboid(half),
             1.0,
-            Vec3::new(0.0, half.y, 0.0),
+            Vec3::new(x_m, half.y, 0.0),
             Vec3::ZERO,
         ),
     );
+    scene.world.entity_mut(scene.ground).insert(surface);
     // Let the block settle (and sink into soft ground) before it slides.
     for _ in 0..500 {
         scene.step();
@@ -397,5 +405,153 @@ fn raycasts_hit_the_undisturbed_soil_surface() {
         ground_hit.point_m.y.abs() < 1.0e-4,
         "{:?}",
         ground_hit.point_m
+    );
+}
+
+/// Rests toes on a flat 2 m × 2 m height field with `surface` and returns,
+/// after `steps`, each toe's sinkage and the ground type reported under it.
+fn toes_on_height_field(
+    surface: GroundSurface,
+    toes_xz: &[(f64, f64)],
+    steps: usize,
+) -> Vec<(f64, Option<GroundType>)> {
+    let mut backend = RapierBackend::new();
+    let world_id = backend.create_world(PhysicsWorldDesc::default()).unwrap();
+    let mut world = World::new();
+    world.spawn((
+        Transform3::from_translation_rotation(Vec3::ZERO, rne_math::Quat::IDENTITY),
+        RigidBody {
+            body_type: RigidBodyType::Fixed,
+            ..RigidBody::default()
+        },
+        Collider {
+            shape: rne_physics::ColliderShape::HeightField {
+                nrows: 5,
+                ncols: 5,
+                heights_m: vec![0.0; 25].into(),
+                scale: Vec3::new(2.0, 1.0, 2.0),
+            },
+            ..Collider::default()
+        },
+        surface,
+    ));
+    let toes: Vec<Entity> = toes_xz
+        .iter()
+        .map(|&(x, z)| {
+            world
+                .spawn((
+                    Transform3::from_translation_rotation(
+                        Vec3::new(x, TOE_RADIUS_M, z),
+                        rne_math::Quat::IDENTITY,
+                    ),
+                    RigidBody {
+                        mass_kg: TOE_MASS_KG,
+                        ..RigidBody::default()
+                    },
+                    Collider::sphere(TOE_RADIUS_M),
+                ))
+                .id()
+        })
+        .collect();
+    for _ in 0..steps {
+        backend.sync_from_ecs(&mut world, world_id).unwrap();
+        backend
+            .step(world_id, SimDuration::from_ticks(DT_NS))
+            .unwrap();
+        backend.sync_to_ecs(&mut world, world_id).unwrap();
+    }
+    let samples = backend.ground_contacts(world_id).unwrap();
+    toes.iter()
+        .map(|&toe| {
+            let y = world.get::<Transform3>(toe).unwrap().translation.y;
+            let kind = samples
+                .iter()
+                .find(|sample| sample.entity == toe)
+                .map(|sample| sample.ground_type);
+            (TOE_RADIUS_M - y, kind)
+        })
+        .collect()
+}
+
+/// 5 × 5 map over the 2 m field: rock for x ≤ −0.5, normal at x = 0, sand
+/// for x ≥ 0.5 except mud along the +Z edge.
+fn mixed_map() -> rne_physics::GroundTypeMap {
+    use GroundType::*;
+    let mut types = Vec::new();
+    for row in 0..5 {
+        for column in 0..5 {
+            types.push(match column {
+                0 | 1 => Rock,
+                2 => Normal,
+                _ if row == 4 => Mud,
+                _ => Sand,
+            });
+        }
+    }
+    rne_physics::GroundTypeMap::from_ground_types(5, 5, &types).unwrap()
+}
+
+#[test]
+fn mixed_ground_map_gives_each_toe_its_own_material() {
+    let toes = [(-0.6, 0.0), (0.0, 0.0), (0.6, 0.0), (0.6, 0.9)];
+    let mixed = toes_on_height_field(GroundSurface::mapped(mixed_map()), &toes, 1500);
+    let kinds: Vec<_> = mixed.iter().map(|(_, kind)| *kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            Some(GroundType::Rock),
+            Some(GroundType::Normal),
+            Some(GroundType::Sand),
+            Some(GroundType::Mud)
+        ]
+    );
+    // Rigid patches stay rigid although the collider is lowered for the mud.
+    assert!(mixed[0].0 < 0.002, "rock {}", mixed[0].0);
+    assert!(mixed[1].0 < 0.002, "normal {}", mixed[1].0);
+    // Soft patches behave as they do on uniform ground of that kind.
+    for (index, kind) in [(2, GroundType::Sand), (3, GroundType::Mud)] {
+        let uniform = toes_on_height_field(GroundSurface::new(kind), &[toes[index]], 1500)[0].0;
+        assert!(uniform > 0.004, "{kind:?} uniform {uniform}");
+        assert!(
+            (mixed[index].0 - uniform).abs() < 1.0e-3,
+            "{kind:?}: mixed {} m, uniform {uniform} m",
+            mixed[index].0
+        );
+    }
+}
+
+#[test]
+fn rigid_only_map_leaves_the_collider_in_place() {
+    use GroundType::*;
+    let map = rne_physics::GroundTypeMap::from_ground_types(2, 1, &[Rock, Normal]).unwrap();
+    let result = toes_on_height_field(GroundSurface::mapped(map), &[(-0.9, 0.0), (0.9, 0.0)], 600);
+    assert_eq!(result[0].1, Some(Rock));
+    assert_eq!(result[1].1, Some(Normal));
+    assert!(
+        result.iter().all(|(sinkage, _)| *sinkage < 0.002),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn mixed_ground_map_sets_friction_per_patch() {
+    use GroundType::*;
+    // Over the 10 m slab: normal for x < 0, rock for x > 0.
+    let map = rne_physics::GroundTypeMap::from_ground_types(2, 1, &[Normal, Rock]).unwrap();
+    let on_normal = slide_distance_on_m(GroundSurface::mapped(map.clone()), -3.0);
+    let on_rock = slide_distance_on_m(GroundSurface::mapped(map), 1.0);
+    let uniform_normal = slide_distance_m(Normal);
+    let uniform_rock = slide_distance_m(Rock);
+    assert!(
+        (on_normal - uniform_normal).abs() < 1.0e-3,
+        "{on_normal} vs {uniform_normal}"
+    );
+    assert!(
+        (on_rock - uniform_rock).abs() < 1.0e-3,
+        "{on_rock} vs {uniform_rock}"
+    );
+    assert!(
+        on_rock < on_normal - 0.02,
+        "rock {on_rock} m, normal {on_normal} m"
     );
 }

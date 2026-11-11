@@ -21,6 +21,7 @@ rne_core = { workspace = true }
 rne_ecs = { workspace = true }
 rne_math = { workspace = true }
 rne_world = { workspace = true }
+png = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 

@@ -8,6 +8,8 @@ use rne_math::{Quat, Vec3};
 use rne_world::Transform3;
 use serde::{Deserialize, Serialize};
 
+use crate::ground_map::GroundTypeMap;
+
 /// Rigid body motion type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RigidBodyType {
@@ -1641,7 +1643,8 @@ pub struct GroundMaterial {
     pub friction: f32,
     /// Upper bound on the combined coefficient before bulldozing is added,
     /// typically `tan(φ)` of a soil's internal friction angle. Infinity for
-    /// rigid ground.
+    /// rigid ground. Serialised as `null` when infinite.
+    #[serde(with = "unbounded_f32")]
     pub max_friction: f32,
     /// Coefficient of restitution, combined like [`PhysicsMaterial::restitution`].
     pub restitution: f32,
@@ -1723,6 +1726,20 @@ impl GroundMaterial {
     }
 }
 
+/// Serialises an `f32` whose infinity means "no bound" as `null`, because
+/// JSON has no infinity.
+mod unbounded_f32 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+        value.is_finite().then_some(*value).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+        Ok(Option::<f32>::deserialize(deserializer)?.unwrap_or(f32::INFINITY))
+    }
+}
+
 impl Default for GroundMaterial {
     fn default() -> Self {
         Self::preset(GroundType::Normal)
@@ -1736,17 +1753,41 @@ impl Default for GroundMaterial {
 /// lets deformable ground yield under load (see [`SoilDeformation`]). Backends
 /// that do not support ground surfaces treat the collider as plain rigid
 /// ground with its own [`PhysicsMaterial`].
-#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// For mixed terrain, set [`Self::map`] (see [`Self::mapped`]): each contact
+/// then takes the material the [`GroundTypeMap`] gives at its position, so one
+/// height field can hold rock, sand and mud side by side.
+#[derive(Component, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GroundSurface {
-    /// Contact behaviour of this ground.
+    /// Contact behaviour of this ground. With a [`Self::map`] it is only the
+    /// collider-level material other systems see; the map decides every
+    /// contact.
     pub material: GroundMaterial,
+    /// Per-point materials over the collider's footprint, if mixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<GroundTypeMap>,
 }
 
 impl GroundSurface {
     /// Ground surface with the nominal material for `ground_type`.
     pub fn new(ground_type: GroundType) -> Self {
+        Self::uniform(GroundMaterial::preset(ground_type))
+    }
+
+    /// Ground surface of one material everywhere.
+    pub fn uniform(material: GroundMaterial) -> Self {
         Self {
-            material: GroundMaterial::preset(ground_type),
+            material,
+            map: None,
+        }
+    }
+
+    /// Mixed ground: each contact uses the material `map` gives at its
+    /// position. [`Self::material`] is set to the map's first material.
+    pub fn mapped(map: GroundTypeMap) -> Self {
+        Self {
+            material: map.materials()[0],
+            map: Some(map),
         }
     }
 }

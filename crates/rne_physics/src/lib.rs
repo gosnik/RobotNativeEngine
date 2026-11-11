@@ -5,6 +5,7 @@
 pub mod backend;
 pub mod components;
 pub mod events;
+pub mod ground_map;
 pub mod hash;
 pub mod hydrodynamics;
 pub mod snapshot;
@@ -29,6 +30,7 @@ pub use events::{
     ContactEvent, ContactPointSample, ContactSeparationSample, ExternalBodyWrench,
     GroundContactSample, RaycastHit, RaycastQuery,
 };
+pub use ground_map::{GroundMapColor, GroundTypeMap, GroundTypeMapError};
 pub use hash::{hash_physics_state, hash_physics_state_v2};
 pub use hydrodynamics::{
     HydrodynamicCoefficients, HydrodynamicMesh, HydrodynamicWrench, HydrodynamicsError,
