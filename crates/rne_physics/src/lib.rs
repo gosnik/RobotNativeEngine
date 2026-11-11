@@ -30,7 +30,7 @@ pub use events::{
     ContactEvent, ContactPointSample, ContactSeparationSample, ExternalBodyWrench,
     GroundContactSample, RaycastHit, RaycastQuery,
 };
-pub use ground_map::{GroundMapColor, GroundTypeMap, GroundTypeMapError};
+pub use ground_map::{GroundMapColor, GroundMapEncoding, GroundTypeMap, GroundTypeMapError};
 pub use hash::{hash_physics_state, hash_physics_state_v2};
 pub use hydrodynamics::{
     HydrodynamicCoefficients, HydrodynamicMesh, HydrodynamicWrench, HydrodynamicsError,

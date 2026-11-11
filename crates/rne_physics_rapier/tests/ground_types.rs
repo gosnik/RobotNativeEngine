@@ -706,3 +706,31 @@ fn normal_cells_of_a_lowered_map_behave_like_plain_terrain() {
     );
     assert!(rotation.angle_between(rne_math::Quat::IDENTITY) < 0.01);
 }
+
+#[test]
+fn encoded_map_sets_softness_and_friction_per_pixel() {
+    use rne_physics::{GroundMapEncoding, GroundTypeMap};
+    let encoding = GroundMapEncoding::default();
+    let sand = encoding.encode(&GroundMaterial::preset(GroundType::Sand));
+    let soft_sand = [sand[0], sand[1], 0xC0];
+    let map = GroundTypeMap::from_encoded_pixels(2, 1, &[sand, soft_sand].concat(), 3, &encoding)
+        .unwrap();
+    let toes = toes_on_height_field(GroundSurface::mapped(map), &[(-0.9, 0.0), (0.9, 0.0)], 1500);
+    assert_eq!(toes[0].1, Some(GroundType::Sand));
+    let uniform = toes_on_height_field(GroundSurface::new(GroundType::Sand), &[(-0.9, 0.0)], 1500);
+    assert!(
+        (toes[0].0 - uniform[0].0).abs() < 1.0e-3,
+        "{toes:?} vs {uniform:?}"
+    );
+    // 4× softer moduli sink a good deal deeper.
+    assert!(toes[1].0 > 1.5 * toes[0].0, "{toes:?}");
+
+    // G = 115 is friction 0.902 on normal ground: it slides like rock.
+    let grippy = GroundTypeMap::from_encoded_pixels(1, 1, &[0, 115, 0], 3, &encoding).unwrap();
+    let on_grippy = slide_distance_on_m(GroundSurface::mapped(grippy), 0.0);
+    let on_rock = slide_distance_m(GroundType::Rock);
+    assert!(
+        (on_grippy - on_rock).abs() < 0.003,
+        "{on_grippy} vs {on_rock}"
+    );
+}

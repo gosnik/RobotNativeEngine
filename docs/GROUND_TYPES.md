@@ -72,6 +72,32 @@ colour, so anti-aliased brush edges are fine:
   geometry is generated differently, so replays are not bit-identical to an
   unmapped collider. Compare runs that use the same map.
 
+### RGB parameter maps
+
+To vary friction and soil properties within a kind, paint the map in the RGB
+parameter encoding and load it with `GroundTypeMap::from_encoded_png(bytes,
+&GroundMapEncoding::default())`:
+
+| Channel | Stores | Encoding |
+|---------|--------|----------|
+| R | ground type | normal 0, rock 85, sand 170, mud 255 (nearest level wins) |
+| G | surface friction | 0–255 maps linearly onto 0–2 (`friction_min`/`friction_max`) |
+| B | deformability and creep | upper 4 bits `d`, lower 4 bits `c` |
+
+- Each pixel starts from its type's preset. G replaces the surface friction in
+  steps of 2/255 ≈ 0.008. For sand and mud the friction cap scales by the same
+  ratio.
+- `d` scales the Bekker moduli by `2^((8 − d)/2)`: 8 is the preset, each step
+  down is √2 stiffer (0 is 16×), each step up √2 softer (15 is about 11×).
+- `c` is the creep speed in steps of 3.75 mm/s: 8 is mud's 0.03 m/s and 0 is no
+  creep.
+- Normal and rock are rigid and ignore B.
+- Preset pixels (`GroundMapEncoding::encode(&GroundMaterial::preset(kind))`):
+  normal `(0, 64, 128)`, rock `(85, 115, 128)`, sand `(170, 64, 128)`, mud
+  `(255, 38, 136)`.
+- Unlike colour-key maps, paint with hard-edged brushes: blended G and B values
+  are taken literally.
+
 ## Deformable ground model
 
 Sand and mud carry a `SoilDeformation`. A contact patch of radius `b` (the
