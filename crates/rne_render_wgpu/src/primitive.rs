@@ -789,6 +789,8 @@ struct BuiltPrimitiveMesh {
 
 pub struct PrimitiveRenderer {
     pipeline: wgpu::RenderPipeline,
+    water: crate::water::WaterRenderer,
+    water_surface: Option<crate::water::WaterSurface>,
     taa_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     taa_sky_pipeline: wgpu::RenderPipeline,
@@ -1580,6 +1582,8 @@ impl PrimitiveRenderer {
 
         Self {
             pipeline,
+            water: crate::water::WaterRenderer::new(device, color_format),
+            water_surface: None,
             taa_pipeline,
             sky_pipeline,
             taa_sky_pipeline,
@@ -1644,6 +1648,11 @@ impl PrimitiveRenderer {
                 &self.box_mesh
             }
         }
+    }
+
+    /// Sets or clears the optional translucent water surface.
+    pub fn set_water(&mut self, water: Option<crate::water::WaterSurface>) {
+        self.water_surface = water;
     }
 
     /// Renders a scene into existing color and depth views without CPU readback.
@@ -2236,6 +2245,18 @@ impl PrimitiveRenderer {
                 &mut encoder,
                 packed_depth_view.expect("TAA scene pass must output packed depth"),
                 targets.color_view,
+            );
+        }
+        // Translucent water over the finished opaque (and resolved) scene.
+        if let Some(water) = &self.water_surface {
+            self.water.encode(
+                queue,
+                &mut encoder,
+                targets.color_view,
+                targets.depth_view,
+                base_view_proj,
+                view.translation,
+                water,
             );
         }
 
@@ -3349,7 +3370,7 @@ fn aabb_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
     ]
 }
 
-fn mat4_to_cols(matrix: Mat4) -> [[f32; 4]; 4] {
+pub(crate) fn mat4_to_cols(matrix: Mat4) -> [[f32; 4]; 4] {
     let cols = matrix.to_cols_array_2d();
     [
         [

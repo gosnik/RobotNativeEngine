@@ -8,6 +8,7 @@ pub mod camera;
 mod environment_filter;
 mod primitive;
 pub mod taa;
+pub mod water;
 
 #[cfg(feature = "viewer")]
 mod overlay;
@@ -18,5 +19,6 @@ pub use backend::WgpuRenderBackend;
 pub use background::BackgroundRenderPass;
 pub use camera::CameraOrbit;
 pub use taa::TaaSettings;
+pub use water::WaterSurface;
 #[cfg(feature = "viewer")]
 pub use viewer::{InteractiveViewer, ViewerError, ViewerScreenshot};

@@ -322,6 +322,11 @@ impl InteractiveViewer {
         Ok(())
     }
 
+    /// Sets or clears the optional translucent water surface.
+    pub fn set_water(&mut self, water: Option<crate::water::WaterSurface>) {
+        self.primitive.set_water(water);
+    }
+
     /// Returns the graphics resources for a UI renderer sharing this surface.
     pub fn graphics_context(&self) -> (&wgpu::Device, &wgpu::Queue, wgpu::TextureFormat) {
         (&self.device, &self.queue, self.config.format)
