@@ -2032,14 +2032,21 @@ fn sync_ground_surface(world: &World, state: &mut RapierWorldState, entity: Enti
     let Some(handle) = state.entity_to_collider.get(&entity).copied() else {
         return;
     };
-    let surface = world.get::<GroundSurface>(entity).filter(|surface| {
-        surface.material.is_valid() && surface.map.as_ref().is_none_or(|map| map.is_valid())
-    });
+    let surface = world.get::<GroundSurface>(entity);
     let current = state
         .ground_materials
         .get(&handle)
         .map(|layout| &layout.surface);
+    // Installed layouts have already passed validation. The immutable map
+    // shares its cell allocation with the ECS component, so equality can
+    // skip the full grid scan on every unchanged physics tick.
     if current == surface {
+        return;
+    }
+    let surface = surface.filter(|surface| {
+        surface.material.is_valid() && surface.map.as_ref().is_none_or(|map| map.is_valid())
+    });
+    if current.is_none() && surface.is_none() {
         return;
     }
     let surface = surface.cloned();
