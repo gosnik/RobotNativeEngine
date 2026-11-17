@@ -1658,14 +1658,15 @@ impl PrimitiveRenderer {
     /// Renders a scene into existing color and depth views without CPU readback.
     #[cfg(feature = "viewer")]
     pub fn render_to_views(&mut self, pass: PrimitiveSurfacePass<'_>) -> Result<(), RenderError> {
-        self.render_to_views_inner(pass, None)
+        self.render_to_views_inner(pass, None, None).map(|_| ())
     }
 
     fn render_to_views_inner(
         &mut self,
         pass: PrimitiveSurfacePass<'_>,
         packed_depth_view: Option<&wgpu::TextureView>,
-    ) -> Result<(), RenderError> {
+        retained_light_view_proj: Option<Mat4>,
+    ) -> Result<Mat4, RenderError> {
         let device = pass.device;
         let queue = pass.queue;
         let camera = pass.camera;
@@ -1690,7 +1691,8 @@ impl PrimitiveRenderer {
             base_view_proj
         };
         let inv_view_proj = view_proj.inverse();
-        let light_view_proj = directional_light_view_projection(scene);
+        let light_view_proj = retained_light_view_proj
+            .unwrap_or_else(|| directional_light_view_projection(scene));
         queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -1702,13 +1704,15 @@ impl PrimitiveRenderer {
                 environment,
             )),
         );
-        queue.write_buffer(
-            &self.shadow_camera_buffer,
-            0,
-            bytemuck::bytes_of(&ShadowUniform {
-                light_view_proj: mat4_to_cols(light_view_proj),
-            }),
-        );
+        if retained_light_view_proj.is_none() {
+            queue.write_buffer(
+                &self.shadow_camera_buffer,
+                0,
+                bytemuck::bytes_of(&ShadowUniform {
+                    light_view_proj: mat4_to_cols(light_view_proj),
+                }),
+            );
+        }
 
         if scene.items.len() > MAX_SCENE_ITEMS as usize {
             return Err(RenderError::RenderFailed(format!(
@@ -1954,14 +1958,6 @@ impl PrimitiveRenderer {
                 resource: self.camera_buffer.as_entire_binding(),
             }],
         });
-        let shadow_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rne_shadow_camera_bind_group"),
-            layout: &self.shadow_camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: self.shadow_camera_buffer.as_entire_binding(),
-            }],
-        });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rne_scene_encoder"),
@@ -1980,7 +1976,15 @@ impl PrimitiveRenderer {
         };
         let packed_depth_view = packed_depth_view.or(taa_depth_view);
 
-        {
+        if retained_light_view_proj.is_none() {
+            let shadow_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rne_shadow_camera_bind_group"),
+                layout: &self.shadow_camera_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.shadow_camera_buffer.as_entire_binding(),
+                }],
+            });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("rne_directional_shadow_pass"),
                 color_attachments: &[],
@@ -2262,7 +2266,7 @@ impl PrimitiveRenderer {
 
         queue.submit(Some(encoder.finish()));
         self.taa.commit(taa_frame);
-        Ok(())
+        Ok(light_view_proj)
     }
 
     pub fn render(
@@ -2299,11 +2303,20 @@ impl PrimitiveRenderer {
         });
         let mut cameras = [(first.camera, first.target, None, 0); N];
         let mut offset = 0;
+        let mut previous_shadow = None;
         for ((pass, read_depth), output) in passes.into_iter().zip(&mut cameras) {
             let (camera, target) = (pass.camera, pass.target);
             // Keep each render's submission ahead of the next eye's uniform
             // writes. The output textures are independent until the final copy.
-            let (color, depth) = self.render_camera_targets(pass, read_depth)?;
+            let scene = pass.scene;
+            // Both eyes of an exposure share an immutable scene and the same
+            // directional light. Queue order keeps its shadow map available.
+            let retained = previous_shadow
+                .filter(|(previous_scene, _)| std::ptr::eq(*previous_scene, scene))
+                .map(|(_, light_view_proj)| light_view_proj);
+            let (color, depth, light_view_proj) =
+                self.render_camera_targets(pass, read_depth, retained)?;
+            previous_shadow = Some((scene, light_view_proj));
             let (bytes_per_row, size) = readback_layout(target);
             let mut copy = |texture: &wgpu::Texture| {
                 let start = offset;
@@ -2353,7 +2366,8 @@ impl PrimitiveRenderer {
         &mut self,
         pass: PrimitiveRenderPass<'_>,
         read_depth: bool,
-    ) -> Result<(wgpu::Texture, Option<wgpu::Texture>), RenderError> {
+        retained_light_view_proj: Option<Mat4>,
+    ) -> Result<(wgpu::Texture, Option<wgpu::Texture>, Mat4), RenderError> {
         let target = pass.target;
         let camera = pass.camera;
         let view = pass.view;
@@ -2418,7 +2432,7 @@ impl PrimitiveRenderer {
             .as_ref()
             .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
 
-        self.render_to_views_inner(
+        let light_view_proj = self.render_to_views_inner(
             PrimitiveSurfacePass {
                 device,
                 queue,
@@ -2436,9 +2450,10 @@ impl PrimitiveRenderer {
                 },
             },
             packed_depth_view.as_ref(),
+            retained_light_view_proj,
         )?;
 
-        Ok((color_texture, packed_depth_texture))
+        Ok((color_texture, packed_depth_texture, light_view_proj))
     }
 
     /// Renders a mesh scene over an optional pre-drawn background color buffer.
@@ -2528,6 +2543,7 @@ impl PrimitiveRenderer {
                 },
             },
             Some(&packed_depth_view),
+            None,
         )?;
 
         let color_buffer;
