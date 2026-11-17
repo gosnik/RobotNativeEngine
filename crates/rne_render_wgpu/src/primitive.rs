@@ -2269,6 +2269,91 @@ impl PrimitiveRenderer {
         &mut self,
         pass: PrimitiveRenderPass<'_>,
     ) -> Result<CameraPassOutput, RenderError> {
+        let [(color, depth)] = self.render_batch([(pass, true)])?;
+        Ok(CameraPassOutput {
+            color,
+            depth: depth.expect("depth requested"),
+        })
+    }
+
+    /// Renders cameras in order and reads all requested outputs with one GPU mapping.
+    pub(crate) fn render_batch<const N: usize>(
+        &mut self,
+        passes: [(PrimitiveRenderPass<'_>, bool); N],
+    ) -> Result<[(ImageFrame, Option<DepthFrame>); N], RenderError> {
+        let (first, _) = &passes[0];
+        let device = first.device;
+        let queue = first.queue;
+        let byte_len: u64 = passes
+            .iter()
+            .map(|(pass, read_depth)| readback_layout(pass.target).1 * (1 + u64::from(*read_depth)))
+            .sum();
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rne_camera_batch_readback"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rne_camera_batch_copies"),
+        });
+        let mut cameras = [(first.camera, first.target, None, 0); N];
+        let mut offset = 0;
+        for ((pass, read_depth), output) in passes.into_iter().zip(&mut cameras) {
+            let (camera, target) = (pass.camera, pass.target);
+            // Keep each render's submission ahead of the next eye's uniform
+            // writes. The output textures are independent until the final copy.
+            let (color, depth) = self.render_camera_targets(pass, read_depth)?;
+            let (bytes_per_row, size) = readback_layout(target);
+            let mut copy = |texture: &wgpu::Texture| {
+                let start = offset;
+                encoder.copy_texture_to_buffer(
+                    texture.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &staging,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: start,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: Some(target.height),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: target.width,
+                        height: target.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                offset += size;
+                start as usize
+            };
+            let color_start = copy(&color);
+            let depth_start = depth.as_ref().map(copy);
+            *output = (camera, target, depth_start, color_start);
+        }
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        wait_for_readback(device, &slice)?;
+        let mapped = slice.get_mapped_range();
+        let outputs = cameras.map(|(camera, target, depth_start, color_start)| {
+            let (bytes_per_row, _) = readback_layout(target);
+            let rgba = unpack_readback(&mapped[color_start..], target, bytes_per_row);
+            let depth = depth_start.map(|start| {
+                let raw = unpack_readback(&mapped[start..], target, bytes_per_row);
+                decode_depth(&raw, target, camera)
+            });
+            (ImageFrame::from_rgba8(target.width, target.height, rgba), depth)
+        });
+        drop(mapped);
+        staging.unmap();
+        Ok(outputs)
+    }
+
+    fn render_camera_targets(
+        &mut self,
+        pass: PrimitiveRenderPass<'_>,
+        read_depth: bool,
+    ) -> Result<(wgpu::Texture, Option<wgpu::Texture>), RenderError> {
         let target = pass.target;
         let camera = pass.camera;
         let view = pass.view;
@@ -2311,24 +2396,27 @@ impl PrimitiveRenderer {
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let packed_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rne_packed_depth_target"),
-            size: wgpu::Extent3d {
-                width: target.width.max(1),
-                height: target.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: PACKED_DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        let packed_depth_texture = read_depth.then(|| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rne_packed_depth_target"),
+                size: wgpu::Extent3d {
+                    width: target.width.max(1),
+                    height: target.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: PACKED_DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
         });
-        let packed_depth_view =
-            packed_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let packed_depth_view = packed_depth_texture
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
 
         self.render_to_views_inner(
             PrimitiveSurfacePass {
@@ -2347,78 +2435,10 @@ impl PrimitiveRenderer {
                     depth_view: &depth_view,
                 },
             },
-            Some(&packed_depth_view),
+            packed_depth_view.as_ref(),
         )?;
 
-        let color_buffer;
-        let depth_buffer;
-        {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rne_scene_readback_encoder"),
-            });
-            let bytes_per_row = align_to(target.width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-            let buffer_size = bytes_per_row as u64 * target.height as u64;
-            color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rne_color_readback"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            depth_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rne_depth_readback"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &color_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &color_buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(bytes_per_row),
-                        rows_per_image: Some(target.height),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: target.width,
-                    height: target.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &packed_depth_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &depth_buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(bytes_per_row),
-                        rows_per_image: Some(target.height),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: target.width,
-                    height: target.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit(Some(encoder.finish()));
-        }
-
-        let color = map_color_buffer(device, &color_buffer, target)?;
-        let depth = map_depth_buffer(device, &depth_buffer, target, camera)?;
-        Ok(CameraPassOutput { color, depth })
+        Ok((color_texture, packed_depth_texture))
     }
 
     /// Renders a mesh scene over an optional pre-drawn background color buffer.
@@ -3234,6 +3254,10 @@ fn map_depth_buffer(
 ) -> Result<DepthFrame, RenderError> {
     let bytes_per_row = align_to(target.width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let raw = map_buffer_to_vec(buffer, device, target, bytes_per_row)?;
+    Ok(decode_depth(&raw, target, camera))
+}
+
+fn decode_depth(raw: &[u8], target: RenderTarget, camera: &Camera) -> DepthFrame {
     let mut depth_m = Vec::with_capacity((target.width * target.height) as usize);
     for chunk in raw.chunks_exact(4) {
         let z = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -3243,7 +3267,7 @@ fn map_depth_buffer(
             camera.far_m as f32,
         ));
     }
-    Ok(DepthFrame::new(target.width, target.height, depth_m))
+    DepthFrame::new(target.width, target.height, depth_m)
 }
 
 fn map_buffer_to_vec(
@@ -3253,6 +3277,18 @@ fn map_buffer_to_vec(
     bytes_per_row: u32,
 ) -> Result<Vec<u8>, RenderError> {
     let slice = buffer.slice(..);
+    wait_for_readback(device, &slice)?;
+    let mapped = slice.get_mapped_range();
+    let bytes = unpack_readback(&mapped, target, bytes_per_row);
+    drop(mapped);
+    buffer.unmap();
+    Ok(bytes)
+}
+
+fn wait_for_readback(
+    device: &wgpu::Device,
+    slice: &wgpu::BufferSlice<'_>,
+) -> Result<(), RenderError> {
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
@@ -3261,20 +3297,24 @@ fn map_buffer_to_vec(
     receiver
         .recv()
         .map_err(|_| RenderError::RenderFailed("readback channel closed".into()))?
-        .map_err(|error| RenderError::RenderFailed(error.to_string()))?;
+        .map_err(|error| RenderError::RenderFailed(error.to_string()))
+}
 
-    let mapped = slice.get_mapped_range();
+fn readback_layout(target: RenderTarget) -> (u32, u64) {
+    let bytes_per_row = align_to(target.width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    (bytes_per_row, u64::from(bytes_per_row) * u64::from(target.height))
+}
+
+fn unpack_readback(mapped: &[u8], target: RenderTarget, bytes_per_row: u32) -> Vec<u8> {
     let mut bytes = vec![0_u8; target.rgba8_len()];
     for y in 0..target.height as usize {
         let src_start = y * bytes_per_row as usize;
-        let dst_start = y * target.width as usize * 4;
         let row_len = target.width as usize * 4;
+        let dst_start = y * row_len;
         bytes[dst_start..dst_start + row_len]
             .copy_from_slice(&mapped[src_start..src_start + row_len]);
     }
-    drop(mapped);
-    buffer.unmap();
-    Ok(bytes)
+    bytes
 }
 
 fn linearize_depth(depth: f32, near: f32, far: f32) -> f32 {

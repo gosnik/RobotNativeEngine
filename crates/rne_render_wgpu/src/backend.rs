@@ -5,7 +5,7 @@ use crate::taa::TaaSettings;
 use pollster::block_on;
 use rne_math::Transform3;
 use rne_render::{
-    Camera, CameraPassOutput, EnvironmentLighting, ImageFrame, RenderBackend, RenderError,
+    Camera, CameraPassOutput, DepthFrame, EnvironmentLighting, ImageFrame, RenderBackend, RenderError,
     RenderScene, RenderTarget,
 };
 
@@ -133,6 +133,37 @@ impl WgpuRenderBackend {
             self.primitive = Some(renderer);
         }
         Ok(self.primitive.as_mut().expect("primitive renderer"))
+    }
+
+    /// Renders left and right views of one scene with one GPU readback.
+    ///
+    /// Both colors are returned in input order. Packed depth is read only
+    /// for the left view and only when requested.
+    pub fn render_stereo(
+        &mut self,
+        eyes: [(&Camera, &Transform3); 2],
+        scene: &RenderScene,
+        clear_color: [f32; 4],
+        read_left_depth: bool,
+    ) -> Result<([ImageFrame; 2], Option<DepthFrame>), RenderError> {
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        let environment = self.environment.clone();
+        let [left, right] = eyes.map(|(camera, view)| PrimitiveRenderPass {
+            device: &device,
+            queue: &queue,
+            target: camera.render_target(),
+            camera,
+            view,
+            scene,
+            environment: &environment,
+            clear_color,
+            preserve_color: false,
+        });
+        let [(left, depth), (right, _)] = self
+            .ensure_primitive_renderer()?
+            .render_batch([(left, read_left_depth), (right, false)])?;
+        Ok(([left, right], depth))
     }
 
     /// Renders a Gaussian-splat background and mesh foreground in one capture.
@@ -627,6 +658,57 @@ mod tests {
                 base_color_texture: None,
                 material: Default::default(),
             }],
+        }
+    }
+
+    #[test]
+    fn stereo_readback_matches_ordered_camera_renders_with_optional_left_depth() {
+        if std::env::var_os("RNE_SKIP_GPU").is_some() {
+            return;
+        }
+        let mut backend = match WgpuRenderBackend::new() {
+            Ok(backend) => backend,
+            Err(RenderError::NoAdapter) => return,
+            Err(error) => panic!("{error}"),
+        };
+        let scene = quad_scene(Arc::new(facing_quad(2.0)));
+        let left_camera = Camera::new(67, 41, 1.0);
+        let left_view = Transform3::IDENTITY;
+        let right_view = Transform3 {
+            translation: Vec3::new(0.7, 0.0, 0.0),
+            ..Transform3::IDENTITY
+        };
+        let clear = [0.2, 0.3, 0.4, 1.0];
+        // Exercise both different padded row strides and shared TAA history.
+        for (taa, right_camera) in [
+            (TaaSettings::disabled(), Camera::new(45, 37, 1.0)),
+            (TaaSettings::enabled(), left_camera),
+        ] {
+            backend.set_taa(taa);
+            backend.reset_taa_history();
+            let left = backend
+                .render_scene_camera(&left_camera, &left_view, &scene, clear)
+                .unwrap();
+            let right = backend
+                .render_scene_camera(&right_camera, &right_view, &scene, clear)
+                .unwrap();
+            assert!(unique_colors(&left.color.rgba8) > 1);
+            assert!(unique_colors(&right.color.rgba8) > 1);
+            assert!(left.depth.depth_m.iter().any(|&d| d < left_camera.far_m as f32));
+            for read_depth in [false, true] {
+                backend.reset_taa_history();
+                let ([left_color, right_color], left_depth) = backend
+                    .render_stereo(
+                        [(&left_camera, &left_view), (&right_camera, &right_view)],
+                        &scene,
+                        clear,
+                        read_depth,
+                    )
+                    .unwrap();
+                assert_eq!(left_color, left.color);
+                assert_eq!(right_color, right.color);
+                assert_eq!(left_depth, read_depth.then(|| left.depth.clone()));
+            }
         }
     }
 
