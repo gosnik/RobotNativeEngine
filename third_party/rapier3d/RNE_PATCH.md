@@ -161,3 +161,16 @@ default value the arithmetic only adds a `min` against `Real::MAX`, so rigid
 contacts are unchanged. `SolverContact::contact_id()` exposes the manifold
 point index of a solver contact. RNE uses both for deformable ground
 (`docs/GROUND_TYPES.md`).
+
+## Sparse multibody inertia assembly
+
+Each link contributes only to the generalized coordinates with a nonzero
+Jacobian column. The same ordered column list is used for the inertia and
+gyro-augmented inertia matrices. Each participating matrix entry uses the
+dense calculation's multiplication and dot-product order. Dense Jacobians,
+nonfinite inputs, and overflowing intermediate columns retain the original
+dense operations. Factorization, constraints, and timestep are independent
+of this assembly optimization.
+
+The `sparse_link_inertia` tests compare the assembled matrices against the
+dense nalgebra calculation for branched Jacobians and overflowing operands.

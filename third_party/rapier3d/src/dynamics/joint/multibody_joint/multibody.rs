@@ -61,6 +61,37 @@ fn concat_rb_mass_matrix(
     result
 }
 
+/// Adds Jᵀ M J, using only the columns participating in this link's motion.
+fn add_link_inertia(
+    mass: &mut DMatrix<Real>,
+    inertia: &SMatrix<Real, SPATIAL_DIM, SPATIAL_DIM>,
+    jacobian: &Jacobian<Real>,
+    active_columns: Option<&[usize]>,
+) {
+    let Some(active) = active_columns.filter(|active| {
+        active.len() < jacobian.ncols() && inertia.iter().all(|value| value.is_finite())
+    }) else {
+        mass.quadform(1.0, inertia, jacobian, 1.0);
+        return;
+    };
+
+    let mut work = SVector::<Real, SPATIAL_DIM>::zeros();
+    for &column in active {
+        // Use the same multiplication and dot-product order as nalgebra's
+        // dense quadform for every entry that can receive a nonzero term.
+        work.gemv(1.0, inertia, &jacobian.column(column), 0.0);
+        if work.iter().all(|value| value.is_finite()) {
+            for &row in active {
+                mass[(row, column)] = jacobian.column(row).dot(&work) + mass[(row, column)];
+            }
+        } else {
+            // An overflow can make even zero times a workspace element
+            // nonfinite. Keep the dense path's propagation for this column.
+            mass.column_mut(column).gemv_tr(1.0, jacobian, &work, 1.0);
+        }
+    }
+}
+
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug)]
 struct KinematicRootMotion {
@@ -781,6 +812,7 @@ impl Multibody {
         }
 
         let mut curr_assembly_id = 0;
+        let mut active_columns = Vec::with_capacity(self.ndofs);
 
         for i in 0..self.links.len() {
             let link = &self.links[i];
@@ -824,10 +856,27 @@ impl Multibody {
             // TODO: this could be better optimized in 2D.
             let rb_mass_matrix_wo_gyro = concat_rb_mass_matrix(rb_mass, rb_inertia);
             let rb_mass_matrix = concat_rb_mass_matrix(rb_mass, augmented_inertia);
-            self.augmented_mass
-                .quadform(1.0, &rb_mass_matrix_wo_gyro, body_jacobian, 1.0);
-            self.acc_augmented_mass
-                .quadform(1.0, &rb_mass_matrix, body_jacobian, 1.0);
+            active_columns.clear();
+            let mut jacobian_finite = true;
+            for (index, column) in body_jacobian.column_iter().enumerate() {
+                jacobian_finite &= column.iter().all(|value| value.is_finite());
+                if column.iter().any(|&value| value != 0.0) {
+                    active_columns.push(index);
+                }
+            }
+            let active = jacobian_finite.then_some(active_columns.as_slice());
+            add_link_inertia(
+                &mut self.augmented_mass,
+                &rb_mass_matrix_wo_gyro,
+                body_jacobian,
+                active,
+            );
+            add_link_inertia(
+                &mut self.acc_augmented_mass,
+                &rb_mass_matrix,
+                body_jacobian,
+                active,
+            );
 
             /*
              *
@@ -1597,6 +1646,62 @@ mod test {
         RigidBodySet,
     };
     use na::{DVector, RowDVector};
+
+    #[test]
+    fn sparse_link_inertia_matches_dense_quadform() {
+        use super::{add_link_inertia, Jacobian};
+        use na::{DMatrix, SMatrix};
+
+        let width = 18;
+        let mut dense = DMatrix::zeros(width, width);
+        let mut sparse = dense.clone();
+        // Different branches share root columns and leave distinct holes.
+        for active in [[0, 2, 7, 8], [0, 2, 13, 17], [0, 2, 7, 17]] {
+            let mut jacobian = Jacobian::<Real>::zeros(width);
+            for column in active {
+                for row in 0..SPATIAL_DIM {
+                    jacobian[(row, column)] =
+                        ((row + 1) as Real * 0.23 - column as Real * 0.11) / 3.0;
+                }
+            }
+            // Include a nonsymmetric inertia term as in the gyro matrix.
+            let inertia = SMatrix::<Real, SPATIAL_DIM, SPATIAL_DIM>::from_fn(|row, col| {
+                (row * 2 + col + 1) as Real * 0.17
+            });
+            dense.quadform(1.0, &inertia, &jacobian, 1.0);
+            add_link_inertia(&mut sparse, &inertia, &jacobian, Some(&active));
+        }
+        assert!(dense
+            .iter()
+            .zip(sparse.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    #[test]
+    fn sparse_link_inertia_preserves_dense_nonfinite_propagation() {
+        use super::{add_link_inertia, Jacobian};
+        use na::{DMatrix, SMatrix};
+
+        let width = 7;
+        let mut jacobian = Jacobian::<Real>::zeros(width);
+        jacobian[(0, 2)] = 2.0;
+        for value in [Real::MAX, Real::INFINITY] {
+            let mut inertia = SMatrix::<Real, SPATIAL_DIM, SPATIAL_DIM>::identity();
+            inertia[(0, 0)] = value;
+            let mut dense = DMatrix::zeros(width, width);
+            let mut sparse = dense.clone();
+            dense.quadform(1.0, &inertia, &jacobian, 1.0);
+            add_link_inertia(&mut sparse, &inertia, &jacobian, Some(&[2]));
+            assert!(dense.iter().any(|entry| !entry.is_finite()));
+            assert!(dense.iter().zip(sparse.iter()).all(|(a, b)| {
+                if a.is_nan() {
+                    b.is_nan()
+                } else {
+                    a.to_bits() == b.to_bits()
+                }
+            }));
+        }
+    }
 
     #[test]
     fn test_multibody_append() {
